@@ -1,8 +1,13 @@
 pub mod classifier;
+pub mod claude_hooks;
 pub mod completion;
 pub mod core;
 pub mod coverage;
 pub mod digest;
+pub mod doctor;
+pub mod hook_calibration;
+pub mod hook_capture;
+pub mod install;
 pub mod metadata;
 pub mod proxy;
 pub mod proxy_attribution;
@@ -21,5 +26,6 @@ pub mod share;
 pub mod tasks;
 pub mod transcript;
 pub mod transcript_import;
+pub mod transcript_privacy;
 
 pub const APP_NAME: &str = "vc-tokmeter";

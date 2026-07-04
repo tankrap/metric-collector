@@ -22,6 +22,12 @@ From a checked-out copy of this repository:
 cargo run -- --help
 ```
 
+Install options are documented in [docs/distribution.md](docs/distribution.md).
+Today the source checkout path is the only implemented path. Static binary,
+`npx`, and `pipx` wrappers are v1 distribution targets and are documented with
+their intended commands so tester instructions can stabilize before packaging
+lands.
+
 Planned v1 flow:
 
 ```sh
