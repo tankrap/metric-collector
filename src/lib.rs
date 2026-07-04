@@ -1,3 +1,4 @@
+pub mod adapter_validation;
 pub mod classifier;
 pub mod claude_hooks;
 pub mod completion;
@@ -24,6 +25,7 @@ pub mod run;
 pub mod scheduler;
 pub mod share;
 pub mod tasks;
+pub mod token_estimator;
 pub mod transcript;
 pub mod transcript_import;
 pub mod transcript_privacy;

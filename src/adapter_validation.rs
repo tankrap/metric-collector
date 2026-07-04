@@ -1,24 +1,9 @@
-#[cfg(adapter_validation_standalone)]
-#[path = "core.rs"]
-mod core;
-#[cfg(adapter_validation_standalone)]
-#[path = "hook_calibration.rs"]
-mod hook_calibration;
-
 use std::error::Error;
 use std::fmt;
 
-#[cfg(adapter_validation_standalone)]
-use self::core::OperationClass;
-#[cfg(adapter_validation_standalone)]
-use self::hook_calibration::{
-    reconcile_hook_estimates, HookTokenEstimate, ReportedUsage, TokenTotals,
-};
-#[cfg(not(adapter_validation_standalone))]
 use crate::core::OperationClass;
-#[cfg(not(adapter_validation_standalone))]
 use crate::hook_calibration::{
-    reconcile_hook_estimates, HookTokenEstimate, ReportedUsage, TokenTotals,
+    HookTokenEstimate, ReportedUsage, TokenTotals, reconcile_hook_estimates,
 };
 
 pub const CALIBRATED_ACCURACY_TOLERANCE: f64 = 0.10;
