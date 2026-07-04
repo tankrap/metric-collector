@@ -1,0 +1,21 @@
+tasks:
+  - id: bug-fix-1
+    title: Fix incorrect empty-state message
+    description: Done when the empty state shows the expected message and the existing behavior still passes.
+    done: false
+  - id: small-feature-1
+    title: Add a compact display option
+    description: Done when users can enable the compact option and the default display remains unchanged.
+    done: false
+  - id: refactor-1
+    title: Simplify duplicated validation logic
+    description: Done when duplicate validation branches use one shared helper with no behavior changes.
+    done: false
+  - id: test-addition-1
+    title: Add coverage for invalid input handling
+    description: Done when invalid input has a focused test that fails before the fix and passes after it.
+    done: false
+  - id: docs-config-cleanup-1
+    title: Clean up stale configuration notes
+    description: Done when obsolete setup notes are removed and the remaining configuration steps match current defaults.
+    done: false
