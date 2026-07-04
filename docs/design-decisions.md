@@ -14,12 +14,23 @@ VC cost.
 
 ## Comparison repetition and dispersion
 
-Mode T comparisons require at least two repetitions per task/profile. Reports
-show medians and IQR when repeated measurements exist, and they always display
-completion rates next to token totals.
+TOPEN-3 is scoped to Mode T only. Mode T comparisons require at least two
+repetitions per task/profile. Reports show medians and IQR when repeated
+measurements exist, and they always display completion rates next to token
+totals.
 
 Rationale: small tester samples need uncertainty surfaced without making the
 five-minute onboarding path depend on a large benchmark campaign.
+
+## Passive self-reports
+
+TOPEN-5 adds lightweight passive self-reports. `vc-tokmeter status` is the
+first self-report surface: it prints the current mode, task/profile labels,
+events captured today, and the top operation class without raw content.
+
+Rationale: passive mode is the product path, so testers need a low-friction way
+to confirm local capture is alive before report generation exists. This should
+stay privacy-safe enough to paste into an issue or chat.
 
 ## Anonymous aggregation
 

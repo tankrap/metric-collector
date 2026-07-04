@@ -9,12 +9,13 @@ outputs, or file contents anywhere.
 
 ## Status
 
-This repository is in early implementation. The CLI command names are reserved,
-and the core modules are being built behind them. Until the adapters and report
-pipeline are complete, commands other than `--help` may return a clear
-not-implemented error.
+This repository is in early implementation. The source-checkout CLI can run the
+passive quickstart, produce first local Grade O report artifacts, enter Mode T
+run planning, run `doctor`, and remove tokmeter-created setup files. Full
+adapter capture, packaged installs, compare reports, and share export are still
+v1 work in progress.
 
-## Quickstart
+## Passive Quickstart
 
 From a checked-out copy of this repository:
 
@@ -28,57 +29,50 @@ Today the source checkout path is the only implemented path. Static binary,
 their intended commands so tester instructions can stabilize before packaging
 lands.
 
-Planned passive-first v1 flow:
+Passive-first source-checkout flow:
 
 ```sh
-vc-tokmeter init
-vc-tokmeter status
-vc-tokmeter report
-vc-tokmeter report --share
-vc-tokmeter uninstall
+cargo run -- init
+cargo run -- status
+cargo run -- report --out .tokmeter/report
+cargo run -- doctor
+cargo run -- uninstall
 ```
 
-Passive mode is the product path: after `init`, capture is local and automatic
-for supported adapters. `status` shows the current mode, events captured today,
-and the top operation class. Task mode is optional lab machinery for controlled
-comparison numbers.
+Passive mode is the product path. The five-minute setup test measures this
+path: install, initialize local capture, check status, and produce the first
+local report. Current source-checkout reports use Grade O self-report fixture
+data until full adapter event aggregation is wired into the CLI.
 
-`init` will detect supported agent tooling, install local passive capture
-wiring, print exactly what changed and how to remove it, and include a one-line
-pointer to optional task mode. `doctor` will verify the wiring and run a short
-self-test. `report --share` will emit a redacted artifact that a tester can
-manually choose to send.
+To verify the source-checkout onboarding path from a clean temporary copy:
+
+```sh
+scripts/timed-onboarding-smoke.sh
+```
+
+`vc-tokmeter status` is the lightweight self-report command. In the current
+early CLI it prints:
+
+```text
+mode=passive task_id=adhoc profile=adhoc events_today=0 top_op_class=n/a
+```
+
+That line is intentionally safe to paste into an issue or chat. It reports
+mode, task/profile labels, today's local event count, and the top operation
+class without source, prompt, path, credential, or tool-output content.
+
+`init` installs local passive capture wiring, prints exactly what changed and
+how to remove it, and includes a one-line pointer to optional task mode.
+`doctor` verifies the local wiring path with a short self-test. `report --share`
+is the planned redacted export path that a tester can manually choose to send.
 
 ## Producing Comparison Numbers
 
-The comparison protocol is Mode T, the lab path for baseline/treatment numbers.
-It uses a local `tasks.yaml` manifest with realistic tasks from the tester's own
-repository. Each task has a one-line done condition. See
-[docs/tasks.md](docs/tasks.md) and [examples/tasks.yaml](examples/tasks.yaml) for
-a starter template.
-
-Planned Mode T flow:
-
-```sh
-vc-tokmeter run --profile baseline --task task-id
-vc-tokmeter run --profile treatment --task task-id
-vc-tokmeter report --compare
-```
-
-Runs are grouped by profile:
-
-- `baseline`: the tester's existing agent workflow.
-- `treatment`: the same task set using the new stack or capture treatment.
-
-Reports label evidence explicitly:
-
-- Grade O is observational passive data. It can show descriptive before/after
-  deltas but not savings claims.
-- Grade P is controlled Mode T data. It can show tokens-per-completed-task
-  comparisons from completed task runs only.
-
-A treatment that appears cheaper by failing tasks should be visible as a lower
-completion rate, not hidden in the math.
+Task mode is not the product quickstart. It is Mode T, the lab path for
+controlled baseline/treatment numbers. Use
+[Producing comparison numbers](docs/producing-comparison-numbers.md) only when a
+tester intentionally wants Grade P evidence from repeated task runs. The current
+CLI can plan and stamp Mode T runs; full compare aggregation remains in progress.
 
 ## Privacy
 

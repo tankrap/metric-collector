@@ -1,6 +1,8 @@
 pub mod adapter_validation;
 pub mod classifier;
 pub mod claude_hooks;
+pub mod cli_report;
+pub mod cli_run;
 pub mod completion;
 pub mod core;
 pub mod coverage;

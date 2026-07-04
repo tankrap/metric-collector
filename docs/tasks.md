@@ -1,9 +1,12 @@
 # Task Manifests
 
-Task manifests define the small set of work items used for baseline and
-treatment comparisons. Start by copying `examples/tasks.yaml` into your working
-area, then replace each sample task with a real task from the repository you are
-measuring.
+Task manifests are used only by Mode T, the lab path for producing controlled
+comparison numbers. They are not required for the passive product quickstart.
+
+Start with [Producing comparison numbers](producing-comparison-numbers.md) when
+you need baseline/treatment evidence. Then copy `examples/tasks.yaml` into your
+working area and replace each sample task with a real task from the repository
+you are measuring.
 
 Keep the shape of the file unchanged:
 
@@ -23,8 +26,8 @@ Each task needs:
   completion.
 - `done`: `false` before the run, then `true` only after the task is complete.
 
-Use 5 to 15 tasks per comparison. Keep descriptions to one line because the
-current parser accepts only single-line scalar values.
+Use 5 to 15 tasks per Mode T comparison. Keep descriptions to one line because
+the current parser accepts only single-line scalar values.
 
 ## Writing Done Conditions
 
