@@ -1,9 +1,10 @@
-use crate::core::{AttributedTokenEvent, OperationClass, TokenCounts, ValidationError};
+use crate::core::{
+    ADHOC_TASK_ID, AttributedTokenEvent, CaptureMode, OperationClass, TokenCounts, ValidationError,
+};
 
 const DEFAULT_TIMESTAMP_MS: u64 = 1;
 const DEFAULT_RUN_ID: &str = "imported-run";
-const DEFAULT_TASK_ID: &str = "imported-task";
-const DEFAULT_PROFILE_ID: &str = "imported-profile";
+const DEFAULT_PROFILE_ID: &str = "adhoc";
 const DEFAULT_ADAPTER: &str = "transcript-import";
 const UNKNOWN_TOOL: &str = "unknown-tool";
 
@@ -16,6 +17,7 @@ pub struct ImportedTranscript {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportedEvent {
     pub timestamp_ms: u64,
+    pub mode: CaptureMode,
     pub run_id: String,
     pub task_id: String,
     pub profile_id: String,
@@ -33,6 +35,7 @@ impl ImportedEvent {
     pub fn to_core_event(&self) -> AttributedTokenEvent {
         AttributedTokenEvent {
             timestamp_ms: self.timestamp_ms,
+            mode: self.mode,
             run_id: self.run_id.clone(),
             task_id: self.task_id.clone(),
             profile_id: self.profile_id.clone(),
@@ -147,7 +150,7 @@ impl Default for ImportDefaults {
         Self {
             timestamp_ms: DEFAULT_TIMESTAMP_MS,
             run_id: DEFAULT_RUN_ID.to_owned(),
-            task_id: DEFAULT_TASK_ID.to_owned(),
+            task_id: ADHOC_TASK_ID.to_owned(),
             profile_id: DEFAULT_PROFILE_ID.to_owned(),
             adapter: DEFAULT_ADAPTER.to_owned(),
         }
@@ -204,6 +207,23 @@ fn import_line(line: &str, defaults: &ImportDefaults) -> Option<ImportedEvent> {
     let run_id = extract_string_any(line, &["run_id", "run"]);
     let task_id = extract_string_any(line, &["task_id", "task"]);
     let profile_id = extract_string_any(line, &["profile_id", "profile"]);
+    let explicit_mode = extract_string_any(line, &["mode", "tokmeter_mode"]);
+    let manifest_task_id = extract_string_any(line, &["manifest_task_id", "tokmeter_task_id"]);
+    let marker_mode = has_any_key(
+        line,
+        &[
+            "tokmeter_task_wrapper",
+            "task_wrapper",
+            "task_manifest",
+            "manifest_task_id",
+        ],
+    );
+    let mode = match explicit_mode.as_deref() {
+        Some("task") => CaptureMode::Task,
+        Some("passive") => CaptureMode::Passive,
+        _ if marker_mode => CaptureMode::Task,
+        _ => CaptureMode::Passive,
+    };
     let adapter = extract_string_any(line, &["adapter", "source"]);
     let raw_tool = extract_string_any(line, &["tool", "tool_name", "name", "recipient_name"]);
     let command = extract_string_any(line, &["command", "cmd", "input", "arguments", "path"]);
@@ -244,8 +264,12 @@ fn import_line(line: &str, defaults: &ImportDefaults) -> Option<ImportedEvent> {
 
     Some(ImportedEvent {
         timestamp_ms: timestamp.unwrap_or(defaults.timestamp_ms),
+        mode,
         run_id: run_id.unwrap_or_else(|| defaults.run_id.clone()),
-        task_id: task_id.unwrap_or_else(|| defaults.task_id.clone()),
+        task_id: task_id.or(manifest_task_id).unwrap_or_else(|| match mode {
+            CaptureMode::Passive => ADHOC_TASK_ID.to_owned(),
+            CaptureMode::Task => defaults.task_id.clone(),
+        }),
         profile_id: profile_id.unwrap_or_else(|| defaults.profile_id.clone()),
         adapter: adapter.unwrap_or_else(|| defaults.adapter.clone()),
         tool: tool.to_owned(),
@@ -704,6 +728,7 @@ mod tests {
 
         let event = &imported.events[0];
         assert_eq!(event.timestamp_ms, 1_725_000_123_456);
+        assert_eq!(event.mode, CaptureMode::Passive);
         assert_eq!(event.run_id, "run-1");
         assert_eq!(event.task_id, "task-1");
         assert_eq!(event.profile_id, "default");
@@ -753,6 +778,46 @@ mod tests {
         assert_eq!(event.tokens.cache_read_tokens, 0);
         assert_eq!(event.tokens.cache_write_tokens, 0);
         event.validate_core_compatible().unwrap();
+    }
+
+    #[test]
+    fn imports_without_task_markers_default_to_passive_adhoc() {
+        let input = concat!(
+            "{\"timestamp_ms\":1725000123456,",
+            "\"type\":\"tool_call\",",
+            "\"tool\":\"Read\",",
+            "\"path\":\"src/lib.rs\",",
+            "\"usage\":{\"input_tokens\":4,\"output_tokens\":0}}\n",
+        );
+
+        let imported = import_transcript(input);
+        let event = &imported.events[0];
+
+        assert_eq!(event.mode, CaptureMode::Passive);
+        assert_eq!(event.task_id, "adhoc");
+        assert_eq!(event.profile_id, "adhoc");
+        event.validate_core_compatible().unwrap();
+    }
+
+    #[test]
+    fn task_wrapper_markers_import_as_task_mode() {
+        let input = concat!(
+            "{\"timestamp_ms\":1725000123456,",
+            "\"type\":\"tool_call\",",
+            "\"tool\":\"Bash\",",
+            "\"command\":\"git status\",",
+            "\"tokmeter_task_wrapper\":true,",
+            "\"manifest_task_id\":\"fix-login\",",
+            "\"profile_id\":\"baseline\",",
+            "\"usage\":{\"input_tokens\":4,\"output_tokens\":0}}\n",
+        );
+
+        let imported = import_transcript(input);
+        let event = &imported.events[0];
+
+        assert_eq!(event.mode, CaptureMode::Task);
+        assert_eq!(event.task_id, "fix-login");
+        assert_eq!(event.profile_id, "baseline");
     }
 
     #[test]

@@ -6,7 +6,9 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::str::FromStr;
 
-pub const EVENT_LOG_SCHEMA_VERSION: u32 = 1;
+pub const EVENT_LOG_SCHEMA_VERSION: u32 = 2;
+pub const EVENT_LOG_SCHEMA_MAJOR_VERSION: u32 = 1;
+pub const ADHOC_TASK_ID: &str = "adhoc";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OperationClass {
@@ -113,6 +115,60 @@ impl fmt::Display for OperationClassParseError {
 
 impl Error for OperationClassParseError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CaptureMode {
+    Passive,
+    Task,
+}
+
+impl CaptureMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passive => "passive",
+            Self::Task => "task",
+        }
+    }
+}
+
+impl Default for CaptureMode {
+    fn default() -> Self {
+        Self::Passive
+    }
+}
+
+impl fmt::Display for CaptureMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CaptureMode {
+    type Err = CaptureModeParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "passive" => Ok(Self::Passive),
+            "task" => Ok(Self::Task),
+            _ => Err(CaptureModeParseError {
+                value: value.to_owned(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureModeParseError {
+    value: String,
+}
+
+impl fmt::Display for CaptureModeParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "unknown capture mode '{}'", self.value)
+    }
+}
+
+impl Error for CaptureModeParseError {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenCounts {
     pub input_tokens: u64,
@@ -153,6 +209,7 @@ impl TokenCounts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributedTokenEvent {
     pub timestamp_ms: u64,
+    pub mode: CaptureMode,
     pub run_id: String,
     pub task_id: String,
     pub profile_id: String,
@@ -266,6 +323,22 @@ impl Default for EventLog {
     }
 }
 
+pub fn migrate_event_log_to_latest(log: &EventLog) -> EventLog {
+    EventLog {
+        events: log
+            .events
+            .iter()
+            .cloned()
+            .map(|mut event| {
+                if event.mode == CaptureMode::Passive && event.task_id.trim().is_empty() {
+                    event.task_id = ADHOC_TASK_ID.to_owned();
+                }
+                event
+            })
+            .collect(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationError {
     pub field: &'static str,
@@ -329,6 +402,7 @@ fn serialize_event(event: &AttributedTokenEvent) -> String {
     IntoIterator::into_iter([
         ("schema", EVENT_LOG_SCHEMA_VERSION.to_string()),
         ("timestamp_ms", event.timestamp_ms.to_string()),
+        ("mode", event.mode.as_str().to_owned()),
         ("run_id", escape_value(&event.run_id)),
         ("task_id", escape_value(&event.task_id)),
         ("profile_id", escape_value(&event.profile_id)),
@@ -387,6 +461,16 @@ fn parse_event_line(line: &str, line_number: usize) -> Result<AttributedTokenEve
     if schema == 0 {
         return Err(parse_error(line_number, "schema must be greater than zero"));
     }
+    let schema_major = schema_major_version(schema);
+    if schema_major > EVENT_LOG_SCHEMA_MAJOR_VERSION {
+        return Err(parse_error(
+            line_number,
+            format!(
+                "schema major {} is newer than supported major {}",
+                schema_major, EVENT_LOG_SCHEMA_MAJOR_VERSION
+            ),
+        ));
+    }
     if schema > EVENT_LOG_SCHEMA_VERSION {
         return Err(parse_error(
             line_number,
@@ -398,6 +482,13 @@ fn parse_event_line(line: &str, line_number: usize) -> Result<AttributedTokenEve
     }
 
     let repeat_of = optional_string_field(&fields, "repeat_of", line_number)?;
+    let mode = if schema == 1 {
+        CaptureMode::Passive
+    } else {
+        field(&fields, "mode", line_number)?
+            .parse()
+            .map_err(|error: CaptureModeParseError| parse_error(line_number, error.to_string()))?
+    };
 
     Ok(AttributedTokenEvent {
         timestamp_ms: parse_u64(
@@ -405,6 +496,7 @@ fn parse_event_line(line: &str, line_number: usize) -> Result<AttributedTokenEve
             "timestamp_ms",
             line_number,
         )?,
+        mode,
         run_id: string_field(&fields, "run_id", line_number)?,
         task_id: string_field(&fields, "task_id", line_number)?,
         profile_id: string_field(&fields, "profile_id", line_number)?,
@@ -443,6 +535,10 @@ fn parse_event_line(line: &str, line_number: usize) -> Result<AttributedTokenEve
         content_digest: string_field(&fields, "digest", line_number)?,
         repeat_of,
     })
+}
+
+fn schema_major_version(schema: u32) -> u32 {
+    if schema < 1000 { 1 } else { schema / 1000 }
 }
 
 fn field<'a>(
@@ -588,6 +684,7 @@ mod tests {
     fn fixture_event() -> AttributedTokenEvent {
         AttributedTokenEvent {
             timestamp_ms: 1_725_000_123_456,
+            mode: CaptureMode::Task,
             run_id: "run-123".to_owned(),
             task_id: "task with tab\tand newline\n".to_owned(),
             profile_id: "default".to_owned(),
@@ -636,6 +733,18 @@ mod tests {
     }
 
     #[test]
+    fn capture_mode_strings_are_frozen() {
+        assert_eq!(CaptureMode::Passive.as_str(), "passive");
+        assert_eq!(CaptureMode::Task.as_str(), "task");
+        assert_eq!(
+            "passive".parse::<CaptureMode>().unwrap(),
+            CaptureMode::Passive
+        );
+        assert_eq!("task".parse::<CaptureMode>().unwrap(), CaptureMode::Task);
+        assert!("adhoc".parse::<CaptureMode>().is_err());
+    }
+
+    #[test]
     fn validation_reports_required_fields() {
         let mut event = fixture_event();
         event.run_id.clear();
@@ -673,7 +782,8 @@ mod tests {
         let event = fixture_event();
         let line = serialize_event(&event);
 
-        assert!(line.starts_with("schema=1\ttimestamp_ms="));
+        assert!(line.starts_with("schema=2\ttimestamp_ms="));
+        assert!(line.contains("\tmode=task\t"));
         assert!(line.contains("\top_class=vc.diff\t"));
         assert!(!line.contains("\tcontent="));
         assert!(!line.contains("\tcontent_digest="));
@@ -737,10 +847,31 @@ mod tests {
     #[test]
     fn parser_rejects_newer_schema_versions() {
         let mut line = serialize_event(&fixture_event());
-        line = line.replacen("schema=1", "schema=2", 1);
+        line = line.replacen("schema=2", "schema=3", 1);
 
         let error = parse_event_line(&line, 1).unwrap_err();
 
-        assert!(error.to_string().contains("newer than supported schema 1"));
+        assert!(error.to_string().contains("newer than supported schema 2"));
+    }
+
+    #[test]
+    fn parser_rejects_unknown_major_schema_versions() {
+        let mut line = serialize_event(&fixture_event());
+        line = line.replacen("schema=2", "schema=2000", 1);
+
+        let error = parse_event_line(&line, 1).unwrap_err();
+
+        assert!(error.to_string().contains("schema major 2"));
+    }
+
+    #[test]
+    fn parser_backfills_schema_one_dev_events_as_passive() {
+        let line = serialize_event(&fixture_event())
+            .replacen("schema=2", "schema=1", 1)
+            .replace("\tmode=task", "");
+
+        let parsed = parse_event_line(&line, 1).unwrap();
+
+        assert_eq!(parsed.mode, CaptureMode::Passive);
     }
 }

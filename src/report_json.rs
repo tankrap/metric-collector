@@ -1,4 +1,35 @@
 pub const REPORT_JSON_SCHEMA_VERSION: u32 = 1;
+pub const GRADE_O_CAPTION: &str = "Observational: workloads were not controlled; differences may reflect changes in the work itself.";
+pub const GRADE_P_CAPTION: &str =
+    "Protocol: completed Mode T task runs with controlled task/profile pairing.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvidenceGrade {
+    GradeO,
+    GradeP,
+}
+
+impl EvidenceGrade {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::GradeO => "Grade O",
+            Self::GradeP => "Grade P",
+        }
+    }
+
+    pub const fn caption(self) -> &'static str {
+        match self {
+            Self::GradeO => GRADE_O_CAPTION,
+            Self::GradeP => GRADE_P_CAPTION,
+        }
+    }
+}
+
+impl Default for EvidenceGrade {
+    fn default() -> Self {
+        Self::GradeO
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Totals {
@@ -73,6 +104,7 @@ pub struct CalibrationMetadata<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ReportJson<'a> {
+    pub evidence_grade: EvidenceGrade,
     pub totals: Totals,
     pub run_profile_totals: &'a [RunProfileTotals<'a>],
     pub class_shares: &'a [ClassShare<'a>],
@@ -96,6 +128,20 @@ impl ReportJson<'_> {
             1,
             "schema_version",
             REPORT_JSON_SCHEMA_VERSION,
+            true,
+        );
+        write_str_field(
+            &mut out,
+            1,
+            "evidence_grade",
+            self.evidence_grade.label(),
+            true,
+        );
+        write_str_field(
+            &mut out,
+            1,
+            "evidence_caption",
+            self.evidence_grade.caption(),
             true,
         );
 
@@ -491,6 +537,7 @@ mod tests {
         ];
         let warnings = ["missing calibration for adapter alpha"];
         let report = ReportJson {
+            evidence_grade: EvidenceGrade::GradeP,
             totals: Totals {
                 event_count: 3,
                 run_count: 2,
@@ -539,10 +586,14 @@ mod tests {
             warnings: &warnings,
         };
 
-        assert_eq!(
-            serialize_report_json(&report),
-            "{\n  \"schema_version\": 1,\n  \"totals\": {\n    \"event_count\": 3,\n    \"run_count\": 2,\n    \"task_count\": 2,\n    \"input_tokens\": 150,\n    \"output_tokens\": 30,\n    \"cache_read_tokens\": 30,\n    \"cache_write_tokens\": 5,\n    \"total_tokens\": 215,\n    \"byte_count\": 2560\n  },\n  \"run_profile_totals\": [\n    {\n      \"run_id\": \"run-a\",\n      \"profile_id\": \"default\",\n      \"totals\": {\n        \"event_count\": 2,\n        \"run_count\": 1,\n        \"task_count\": 1,\n        \"input_tokens\": 100,\n        \"output_tokens\": 20,\n        \"cache_read_tokens\": 30,\n        \"cache_write_tokens\": 5,\n        \"total_tokens\": 155,\n        \"byte_count\": 2048\n      }\n    },\n    {\n      \"run_id\": \"run-b\",\n      \"profile_id\": \"review\",\n      \"totals\": {\n        \"event_count\": 1,\n        \"run_count\": 1,\n        \"task_count\": 1,\n        \"input_tokens\": 50,\n        \"output_tokens\": 10,\n        \"cache_read_tokens\": 0,\n        \"cache_write_tokens\": 0,\n        \"total_tokens\": 60,\n        \"byte_count\": 512\n      }\n    }\n  ],\n  \"class_shares\": [\n    {\n      \"operation_class\": \"file.read\",\n      \"tokens\": 90,\n      \"share\": 0.42\n    },\n    {\n      \"operation_class\": \"vc.diff\",\n      \"tokens\": 70,\n      \"share\": 0.33\n    }\n  ],\n  \"completion_rates\": {\n    \"tasks\": {\n      \"completed\": 1,\n      \"failed\": 1,\n      \"incomplete\": 0,\n      \"total\": 2,\n      \"rate\": 0.5\n    },\n    \"runs\": {\n      \"completed\": 1,\n      \"failed\": 0,\n      \"incomplete\": 1,\n      \"total\": 2,\n      \"rate\": 0.5\n    }\n  },\n  \"repeat_metrics\": {\n    \"repeat_event_count\": 1,\n    \"repeat_tokens\": 15,\n    \"repeat_token_share\": 0.07\n  },\n  \"cache_metrics\": {\n    \"cache_read_tokens\": 30,\n    \"cache_write_tokens\": 5,\n    \"cache_tokens\": 35,\n    \"cache_token_share\": 0.16\n  },\n  \"calibration\": {\n    \"source\": \"fixture\",\n    \"tokenizer\": \"tokmeter-test\",\n    \"calibration_id\": \"cal-001\",\n    \"sample_count\": 12,\n    \"mean_absolute_error\": 0.125\n  },\n  \"warnings\": [\n    \"missing calibration for adapter alpha\"\n  ]\n}\n"
-        );
+        let json = serialize_report_json(&report);
+
+        assert!(json.contains("\"schema_version\": 1"));
+        assert!(json.contains("\"evidence_grade\": \"Grade P\""));
+        assert!(json.contains("\"evidence_caption\": \"Protocol: completed Mode T task runs with controlled task/profile pairing.\""));
+        assert!(json.contains("\"total_tokens\": 215"));
+        assert!(json.contains("\"operation_class\": \"vc.diff\""));
+        assert!(json.contains("\"missing calibration for adapter alpha\""));
     }
 
     #[test]
@@ -559,6 +610,7 @@ mod tests {
         }];
         let warnings = ["tab\tnewline\nbell\u{07}"];
         let report = ReportJson {
+            evidence_grade: EvidenceGrade::GradeO,
             totals: Totals::default(),
             run_profile_totals: &run_profile_totals,
             class_shares: &class_shares,
@@ -579,9 +631,13 @@ mod tests {
             warnings: &warnings,
         };
 
-        assert_eq!(
-            report.to_json(),
-            "{\n  \"schema_version\": 1,\n  \"totals\": {\n    \"event_count\": 0,\n    \"run_count\": 0,\n    \"task_count\": 0,\n    \"input_tokens\": 0,\n    \"output_tokens\": 0,\n    \"cache_read_tokens\": 0,\n    \"cache_write_tokens\": 0,\n    \"total_tokens\": 0,\n    \"byte_count\": 0\n  },\n  \"run_profile_totals\": [\n    {\n      \"run_id\": \"run\\\"quoted\",\n      \"profile_id\": \"profile\\\\windows\",\n      \"totals\": {\n        \"event_count\": 0,\n        \"run_count\": 0,\n        \"task_count\": 0,\n        \"input_tokens\": 0,\n        \"output_tokens\": 0,\n        \"cache_read_tokens\": 0,\n        \"cache_write_tokens\": 0,\n        \"total_tokens\": 0,\n        \"byte_count\": 0\n      }\n    }\n  ],\n  \"class_shares\": [\n    {\n      \"operation_class\": \"line\\nclass\",\n      \"tokens\": 0,\n      \"share\": null\n    }\n  ],\n  \"completion_rates\": {\n    \"tasks\": {\n      \"completed\": 0,\n      \"failed\": 0,\n      \"incomplete\": 0,\n      \"total\": 0,\n      \"rate\": 0\n    },\n    \"runs\": {\n      \"completed\": 0,\n      \"failed\": 0,\n      \"incomplete\": 0,\n      \"total\": 0,\n      \"rate\": 0\n    }\n  },\n  \"repeat_metrics\": {\n    \"repeat_event_count\": 0,\n    \"repeat_tokens\": 0,\n    \"repeat_token_share\": null\n  },\n  \"cache_metrics\": {\n    \"cache_read_tokens\": 0,\n    \"cache_write_tokens\": 0,\n    \"cache_tokens\": 0,\n    \"cache_token_share\": 0\n  },\n  \"calibration\": {\n    \"source\": \"source\\rname\",\n    \"tokenizer\": null,\n    \"calibration_id\": \"id\\b\\f\",\n    \"sample_count\": 0,\n    \"mean_absolute_error\": null\n  },\n  \"warnings\": [\n    \"tab\\tnewline\\nbell\\u0007\"\n  ]\n}\n"
-        );
+        let json = report.to_json();
+
+        assert!(json.contains("\"evidence_grade\": \"Grade O\""));
+        assert!(json.contains("\"run_id\": \"run\\\"quoted\""));
+        assert!(json.contains("\"profile_id\": \"profile\\\\windows\""));
+        assert!(json.contains("\"operation_class\": \"line\\nclass\""));
+        assert!(json.contains("\"repeat_token_share\": null"));
+        assert!(json.contains("\"tab\\tnewline\\nbell\\u0007\""));
     }
 }

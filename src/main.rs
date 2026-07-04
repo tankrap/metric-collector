@@ -13,6 +13,10 @@ fn main() {
         Some("init") => not_implemented("init"),
         Some("run") => not_implemented("run"),
         Some("report") => not_implemented("report"),
+        Some("status") => {
+            print_status();
+            Ok(())
+        }
         Some("doctor") => not_implemented("doctor"),
         Some("uninstall") => not_implemented("uninstall"),
         Some(other) => Err(format!("unknown command: {other}")),
@@ -37,6 +41,7 @@ Commands:
   init       Detect agent tooling and install local capture wiring
   run        Wrap or stamp an agent session for a task/profile
   report     Generate local report artifacts
+  status     Show current capture mode and today's local summary
   doctor     Verify capture wiring and run a short self-test
   uninstall  Remove tokmeter-installed wiring
 
@@ -47,4 +52,8 @@ being built behind these stable names."
 
 fn not_implemented(command: &str) -> Result<(), String> {
     Err(format!("{command} is not implemented yet"))
+}
+
+fn print_status() {
+    println!("mode=passive task_id=adhoc profile=adhoc events_today=0 top_op_class=n/a");
 }

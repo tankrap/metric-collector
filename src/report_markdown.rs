@@ -1,6 +1,43 @@
+pub const GRADE_O_CAPTION: &str = "Observational: workloads were not controlled; differences may reflect changes in the work itself.";
+pub const GRADE_P_CAPTION: &str =
+    "Protocol: completed Mode T task runs with controlled task/profile pairing.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvidenceGrade {
+    GradeO,
+    GradeP,
+}
+
+impl EvidenceGrade {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::GradeO => "Grade O",
+            Self::GradeP => "Grade P",
+        }
+    }
+
+    pub const fn caption(self) -> &'static str {
+        match self {
+            Self::GradeO => GRADE_O_CAPTION,
+            Self::GradeP => GRADE_P_CAPTION,
+        }
+    }
+
+    pub const fn allows_savings_headline(self) -> bool {
+        matches!(self, Self::GradeP)
+    }
+}
+
+impl Default for EvidenceGrade {
+    fn default() -> Self {
+        Self::GradeO
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MarkdownReport<'a> {
     pub title: &'a str,
+    pub evidence_grade: EvidenceGrade,
     pub single_profile: Option<ProfileSummary<'a>>,
     pub comparison: Option<CompareSummary<'a>>,
     pub warnings: &'a [&'a str],
@@ -98,13 +135,14 @@ pub fn render_report_markdown(report: &MarkdownReport<'_>) -> String {
     out.push_str(&escape_inline(title));
     out.push_str("\n\n");
     write_warnings(&mut out, report.warnings);
+    write_evidence_grade(&mut out, report.evidence_grade);
 
     if let Some(summary) = &report.single_profile {
-        write_profile_summary(&mut out, summary);
+        write_profile_summary(&mut out, summary, report.evidence_grade);
     }
 
     if let Some(comparison) = &report.comparison {
-        write_compare_summary(&mut out, comparison);
+        write_compare_summary(&mut out, comparison, report.evidence_grade);
     }
 
     out
@@ -141,35 +179,65 @@ fn write_warnings(out: &mut String, warnings: &[&str]) {
     out.push_str("\n\n");
 }
 
-fn write_profile_summary(out: &mut String, summary: &ProfileSummary<'_>) {
+fn write_evidence_grade(out: &mut String, grade: EvidenceGrade) {
+    out.push_str("**Evidence:** ");
+    out.push_str(grade.label());
+    out.push_str(" - ");
+    out.push_str(grade.caption());
+    out.push_str("\n\n");
+}
+
+fn write_profile_summary(out: &mut String, summary: &ProfileSummary<'_>, grade: EvidenceGrade) {
     out.push_str("## Summary\n\n");
-    out.push_str("| Metric | Value |\n");
-    out.push_str("| --- | ---: |\n");
-    write_table_row(out, "Profile", &escape_table_cell(summary.profile_id));
-    write_table_row(out, "Runs", &format_u64(summary.run_count));
-    write_table_row(out, "Tasks", &format_u64(summary.task_count));
-    write_table_row(out, "Events", &format_u64(summary.event_count));
-    write_table_row(out, "Total tokens", &format_u64(summary.total_tokens));
-    write_table_row(out, "Input tokens", &format_u64(summary.input_tokens));
-    write_table_row(out, "Output tokens", &format_u64(summary.output_tokens));
+    out.push_str("| Metric | Evidence | Value |\n");
+    out.push_str("| --- | --- | ---: |\n");
+    write_table_row(
+        out,
+        "Profile",
+        grade,
+        &escape_table_cell(summary.profile_id),
+    );
+    write_table_row(out, "Runs", grade, &format_u64(summary.run_count));
+    write_table_row(out, "Tasks", grade, &format_u64(summary.task_count));
+    write_table_row(out, "Events", grade, &format_u64(summary.event_count));
+    write_table_row(
+        out,
+        "Total tokens",
+        grade,
+        &format_u64(summary.total_tokens),
+    );
+    write_table_row(
+        out,
+        "Input tokens",
+        grade,
+        &format_u64(summary.input_tokens),
+    );
+    write_table_row(
+        out,
+        "Output tokens",
+        grade,
+        &format_u64(summary.output_tokens),
+    );
     write_table_row(
         out,
         "Cache read tokens",
+        grade,
         &format_u64(summary.cache_read_tokens),
     );
     write_table_row(
         out,
         "Cache write tokens",
+        grade,
         &format_u64(summary.cache_write_tokens),
     );
-    write_table_row(out, "Bytes", &format_u64(summary.byte_count));
+    write_table_row(out, "Bytes", grade, &format_u64(summary.byte_count));
 
     if let Some(distribution) = summary.token_distribution {
         if let Some(median) = distribution.median {
-            write_table_row(out, "Median tokens", &format_number(median));
+            write_table_row(out, "Median tokens", grade, &format_number(median));
         }
         if let Some(iqr) = distribution.iqr {
-            write_table_row(out, "IQR tokens", &format_number(iqr));
+            write_table_row(out, "IQR tokens", grade, &format_number(iqr));
         }
     }
 
@@ -186,7 +254,7 @@ fn write_single_completion_rates(out: &mut String, completion_rates: &Completion
     out.push('\n');
 }
 
-fn write_compare_summary(out: &mut String, comparison: &CompareSummary<'_>) {
+fn write_compare_summary(out: &mut String, comparison: &CompareSummary<'_>, grade: EvidenceGrade) {
     out.push_str("## Baseline vs treatment\n\n");
     out.push_str("Baseline: **");
     out.push_str(&escape_inline(comparison.baseline_profile_id));
@@ -195,12 +263,12 @@ fn write_compare_summary(out: &mut String, comparison: &CompareSummary<'_>) {
     out.push_str("**\n\n");
 
     if !comparison.rows.is_empty() {
-        write_compare_rows(out, comparison.rows);
+        write_compare_rows(out, comparison.rows, grade);
     }
     write_completion_comparison(out, &comparison.completion_rates);
 }
 
-fn write_compare_rows(out: &mut String, rows: &[CompareRow<'_>]) {
+fn write_compare_rows(out: &mut String, rows: &[CompareRow<'_>], grade: EvidenceGrade) {
     let has_distribution = rows.iter().any(|row| {
         row.baseline.median.is_some()
             || row.baseline.iqr.is_some()
@@ -209,22 +277,30 @@ fn write_compare_rows(out: &mut String, rows: &[CompareRow<'_>]) {
     });
 
     if has_distribution {
-        out.push_str("| Metric | Baseline | Treatment | Token savings (baseline - treatment) | Baseline median | Baseline IQR | Treatment median | Treatment IQR |\n");
-        out.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+        out.push_str("| Metric | Evidence | Baseline | Treatment | Delta (baseline - treatment) | Baseline median | Baseline IQR | Treatment median | Treatment IQR |\n");
+        out.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
     } else {
-        out.push_str("| Metric | Baseline | Treatment | Token savings (baseline - treatment) |\n");
-        out.push_str("| --- | ---: | ---: | ---: |\n");
+        out.push_str(
+            "| Metric | Evidence | Baseline | Treatment | Delta (baseline - treatment) |\n",
+        );
+        out.push_str("| --- | --- | ---: | ---: | ---: |\n");
     }
 
     for row in rows {
         out.push_str("| ");
         out.push_str(&escape_table_cell(row.metric));
         out.push_str(" | ");
+        out.push_str(grade.label());
+        out.push_str(" | ");
         out.push_str(&format_number(row.baseline.value));
         out.push_str(" | ");
         out.push_str(&format_number(row.treatment.value));
         out.push_str(" | ");
-        out.push_str(&format_savings(row.baseline.value, row.treatment.value));
+        out.push_str(&format_delta(
+            row.baseline.value,
+            row.treatment.value,
+            grade,
+        ));
         if has_distribution {
             out.push_str(" | ");
             out.push_str(&format_optional_number(row.baseline.median));
@@ -249,9 +325,11 @@ fn write_completion_comparison(out: &mut String, comparison: &CompletionRateComp
     out.push('\n');
 }
 
-fn write_table_row(out: &mut String, metric: &str, value: &str) {
+fn write_table_row(out: &mut String, metric: &str, grade: EvidenceGrade, value: &str) {
     out.push_str("| ");
     out.push_str(metric);
+    out.push_str(" | ");
+    out.push_str(grade.label());
     out.push_str(" | ");
     out.push_str(value);
     out.push_str(" |\n");
@@ -302,16 +380,20 @@ fn format_rate(rate: CompletionRate) -> String {
     }
 }
 
-fn format_savings(baseline: f64, treatment: f64) -> String {
-    let savings = baseline - treatment;
+fn format_delta(baseline: f64, treatment: f64, grade: EvidenceGrade) -> String {
+    let delta = baseline - treatment;
     if baseline == 0.0 || !baseline.is_finite() || !treatment.is_finite() {
-        return format!("{} (n/a)", format_number(savings));
+        return format!("{} (n/a)", format_number(delta));
+    }
+
+    if !grade.allows_savings_headline() {
+        return format!("{} descriptive delta only", format_number(delta));
     }
 
     format!(
         "{} ({})",
-        format_number(savings),
-        format_percent(savings / baseline)
+        format_number(delta),
+        format_percent(delta / baseline)
     )
 }
 
@@ -481,10 +563,15 @@ mod tests {
             ..MarkdownReport::default()
         };
 
-        assert_eq!(
-            serialize_report_markdown(&report),
-            "# report.md\n\n> **Warning:** metadata mismatch\n\n## Summary\n\n| Metric | Value |\n| --- | ---: |\n| Profile | baseline |\n| Runs | 2 |\n| Tasks | 5 |\n| Events | 12 |\n| Total tokens | 13,750 |\n| Input tokens | 10,000 |\n| Output tokens | 2,500 |\n| Cache read tokens | 1,000 |\n| Cache write tokens | 250 |\n| Bytes | 42,000 |\n| Median tokens | 2,750 |\n| IQR tokens | 500.5 |\n\n## Completion rates\n\n| Scope | Completed | Failed | Incomplete | Total | Completion rate |\n| --- | ---: | ---: | ---: | ---: | ---: |\n| Tasks | 4 | 1 | 0 | 5 | 80.0% |\n| Runs | 1 | 0 | 1 | 2 | 50.0% |\n\n"
-        );
+        let markdown = serialize_report_markdown(&report);
+
+        assert!(markdown.contains("# report.md"));
+        assert!(markdown.contains("> **Warning:** metadata mismatch"));
+        assert!(markdown.contains("**Evidence:** Grade O - Observational: workloads were not controlled; differences may reflect changes in the work itself."));
+        assert!(markdown.contains("| Metric | Evidence | Value |"));
+        assert!(markdown.contains("| Total tokens | Grade O | 13,750 |"));
+        assert!(markdown.contains("| IQR tokens | Grade O | 500.5 |"));
+        assert!(markdown.contains("| Tasks | 4 | 1 | 0 | 5 | 80.0% |"));
     }
 
     #[test]
@@ -555,9 +642,9 @@ mod tests {
 
         let markdown = render_compare_markdown(&comparison, &[]);
 
-        assert!(markdown.contains("Token savings (baseline - treatment)"));
+        assert!(markdown.contains("Delta (baseline - treatment)"));
         assert!(markdown.contains(
-            "| Total tokens | 12,000 | 9,000 | 3,000 (25.0%) | 3,000 | 900 | 2,100 | 600 |"
+            "| Total tokens | Grade O | 12,000 | 9,000 | 3,000 descriptive delta only | 3,000 | 900 | 2,100 | 600 |"
         ));
         assert!(markdown.contains("## Completion rate changes"));
         assert!(markdown.contains("| Tasks | 90.0% (9/10) | 80.0% (8/10) | -10.0 pp |"));
@@ -575,7 +662,7 @@ mod tests {
         let markdown = render_profile_summary_markdown(&summary, &["first line\nsecond | line"]);
 
         assert!(markdown.contains("> **Warning:** first line\n> second | line\n\n"));
-        assert!(markdown.contains("| Profile | base\\|line one |"));
+        assert!(markdown.contains("| Profile | Grade O | base\\|line one |"));
     }
 
     #[test]
@@ -599,7 +686,7 @@ mod tests {
 
         let markdown = render_compare_markdown(&comparison, &[]);
 
-        assert!(markdown.contains("| Total tokens | 0 | 100 | -100 (n/a) |"));
+        assert!(markdown.contains("| Total tokens | Grade O | 0 | 100 | -100 (n/a) |"));
         assert!(markdown.contains("| Tasks | n/a (0/0) | n/a (0/0) | n/a |"));
     }
 
@@ -623,6 +710,40 @@ mod tests {
 
         let markdown = render_compare_markdown(&comparison, &[]);
 
-        assert!(markdown.contains("| Total tokens | 12,345.5 | 10,000 | 2,345.5 (19.0%) |"));
+        assert!(markdown.contains(
+            "| Total tokens | Grade O | 12,345.5 | 10,000 | 2,345.5 descriptive delta only |"
+        ));
+    }
+
+    #[test]
+    fn grade_p_comparisons_can_show_savings_percentages() {
+        let rows = [CompareRow {
+            metric: "Tokens per completed task",
+            baseline: MetricValue {
+                value: 12_000.0,
+                ..MetricValue::default()
+            },
+            treatment: MetricValue {
+                value: 9_000.0,
+                ..MetricValue::default()
+            },
+        }];
+        let report = MarkdownReport {
+            evidence_grade: EvidenceGrade::GradeP,
+            comparison: Some(CompareSummary {
+                rows: &rows,
+                ..CompareSummary::default()
+            }),
+            ..MarkdownReport::default()
+        };
+
+        let markdown = render_report_markdown(&report);
+
+        assert!(markdown.contains("**Evidence:** Grade P"));
+        assert!(
+            markdown.contains(
+                "| Tokens per completed task | Grade P | 12,000 | 9,000 | 3,000 (25.0%) |"
+            )
+        );
     }
 }

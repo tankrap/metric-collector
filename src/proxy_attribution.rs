@@ -1,8 +1,14 @@
+use crate::core::{ADHOC_TASK_ID, CaptureMode};
+use crate::mode::{DEFAULT_PASSIVE_PROFILE_ID, ModeState};
+
 pub const DIGEST_PLACEHOLDER: &str = "placeholder";
 pub const UNKNOWN_TOOL: &str = "unknown-tool";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributionEvent {
+    pub mode: CaptureMode,
+    pub task_id: String,
+    pub profile_id: String,
     pub op_class: String,
     pub tool: String,
     pub byte_count: u64,
@@ -30,6 +36,14 @@ pub fn attribution_events_from_json(
     request_json: &str,
     message_json: &str,
 ) -> Vec<AttributionEvent> {
+    attribution_events_from_json_with_mode(request_json, message_json, &ModeState::passive())
+}
+
+pub fn attribution_events_from_json_with_mode(
+    request_json: &str,
+    message_json: &str,
+    mode_state: &ModeState,
+) -> Vec<AttributionEvent> {
     let tool_uses = collect_tool_uses(request_json);
     let mut events = Vec::new();
 
@@ -54,6 +68,9 @@ pub fn attribution_events_from_json(
         let unattributed = tool == UNKNOWN_TOOL || op_class == "other";
 
         events.push(AttributionEvent {
+            mode: mode_state.mode,
+            task_id: mode_state.task_id.clone(),
+            profile_id: mode_state.profile_id.clone(),
             op_class: op_class.to_owned(),
             tool,
             byte_count: result_byte_count(block.text),
@@ -70,12 +87,28 @@ pub fn attribute_proxy_json(request_json: &str, message_json: &str) -> Vec<Attri
     attribution_events_from_json(request_json, message_json)
 }
 
+pub fn attribute_proxy_json_with_mode(
+    request_json: &str,
+    message_json: &str,
+    mode_state: &ModeState,
+) -> Vec<AttributionEvent> {
+    attribution_events_from_json_with_mode(request_json, message_json, mode_state)
+}
+
 pub fn attribute_json(request_json: &str, message_json: &str) -> Vec<AttributionEvent> {
     attribution_events_from_json(request_json, message_json)
 }
 
 pub fn attribution_events_from_message_json(message_json: &str) -> Vec<AttributionEvent> {
     attribution_events_from_json("", message_json)
+}
+
+pub fn passive_proxy_mode() -> ModeState {
+    ModeState {
+        mode: CaptureMode::Passive,
+        task_id: ADHOC_TASK_ID.to_owned(),
+        profile_id: DEFAULT_PASSIVE_PROFILE_ID.to_owned(),
+    }
 }
 
 fn collect_tool_uses(input: &str) -> Vec<ToolUse> {
@@ -595,6 +628,9 @@ mod tests {
         let events = attribution_events_from_json(request, message);
 
         assert_eq!(events.len(), 1);
+        assert_eq!(events[0].mode, CaptureMode::Passive);
+        assert_eq!(events[0].task_id, "adhoc");
+        assert_eq!(events[0].profile_id, "adhoc");
         assert_eq!(events[0].op_class, "vc.diff");
         assert_eq!(events[0].tool, "Bash");
         assert_eq!(events[0].byte_count, 50);
@@ -663,5 +699,23 @@ mod tests {
         assert!(!events[0].op_class.contains(secret));
         assert!(!events[0].tool.contains(secret));
         assert!(!rendered.contains(secret));
+    }
+
+    #[test]
+    fn proxy_events_can_be_stamped_with_task_mode_state() {
+        let state = ModeState::task("fix-login", "treatment").unwrap();
+        let message = r#"{
+            "content": [{
+                "type": "tool_result",
+                "tool": "Read",
+                "content": "pub fn main() {}\n"
+            }]
+        }"#;
+
+        let events = attribute_proxy_json_with_mode("", message, &state);
+
+        assert_eq!(events[0].mode, CaptureMode::Task);
+        assert_eq!(events[0].task_id, "fix-login");
+        assert_eq!(events[0].profile_id, "treatment");
     }
 }

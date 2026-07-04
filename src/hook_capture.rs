@@ -1,8 +1,11 @@
 use crate::classifier::{Classifier, Event};
 #[cfg(test)]
 use crate::core::EventLog;
-use crate::core::{AttributedTokenEvent, OperationClass, TokenCounts, ValidationError};
+use crate::core::{
+    AttributedTokenEvent, CaptureMode, OperationClass, TokenCounts, ValidationError,
+};
 use crate::digest::digest_bytes;
+use crate::mode::{DEFAULT_PASSIVE_PROFILE_ID, ModeState};
 
 const DEFAULT_ADAPTER: &str = "claude-code-hook";
 const UNKNOWN_TOOL: &str = "unknown-tool";
@@ -10,6 +13,7 @@ const UNKNOWN_TOOL: &str = "unknown-tool";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HookCaptureMetadata<'a> {
     pub timestamp_ms: u64,
+    pub mode: CaptureMode,
     pub run_id: &'a str,
     pub task_id: &'a str,
     pub profile_id: &'a str,
@@ -17,19 +21,42 @@ pub struct HookCaptureMetadata<'a> {
 }
 
 impl<'a> HookCaptureMetadata<'a> {
-    pub const fn new(
-        timestamp_ms: u64,
-        run_id: &'a str,
-        task_id: &'a str,
-        profile_id: &'a str,
-    ) -> Self {
+    pub fn new(timestamp_ms: u64, run_id: &'a str, task_id: &'a str, profile_id: &'a str) -> Self {
         Self {
             timestamp_ms,
+            mode: infer_mode(task_id),
             run_id,
             task_id,
             profile_id,
             adapter: DEFAULT_ADAPTER,
         }
+    }
+
+    pub fn passive(timestamp_ms: u64, run_id: &'a str) -> Self {
+        Self {
+            timestamp_ms,
+            mode: CaptureMode::Passive,
+            run_id,
+            task_id: crate::core::ADHOC_TASK_ID,
+            profile_id: DEFAULT_PASSIVE_PROFILE_ID,
+            adapter: DEFAULT_ADAPTER,
+        }
+    }
+
+    pub fn from_mode_state(timestamp_ms: u64, run_id: &'a str, state: &'a ModeState) -> Self {
+        Self {
+            timestamp_ms,
+            mode: state.mode,
+            run_id,
+            task_id: &state.task_id,
+            profile_id: &state.profile_id,
+            adapter: DEFAULT_ADAPTER,
+        }
+    }
+
+    pub const fn with_mode(mut self, mode: CaptureMode) -> Self {
+        self.mode = mode;
+        self
     }
 }
 
@@ -144,6 +171,7 @@ fn build_event(
 ) -> Result<AttributedTokenEvent, ValidationError> {
     let event = AttributedTokenEvent {
         timestamp_ms: payload.metadata.timestamp_ms,
+        mode: payload.metadata.mode,
         run_id: payload.metadata.run_id.to_owned(),
         task_id: payload.metadata.task_id.to_owned(),
         profile_id: payload.metadata.profile_id.to_owned(),
@@ -225,6 +253,14 @@ fn hook_empty_digest() -> String {
     hook_field_digest("usage", "")
 }
 
+fn infer_mode(task_id: &str) -> CaptureMode {
+    if task_id == crate::core::ADHOC_TASK_ID {
+        CaptureMode::Passive
+    } else {
+        CaptureMode::Task
+    }
+}
+
 fn is_bash_tool(tool_name: &str) -> bool {
     tool_name.eq_ignore_ascii_case("bash")
 }
@@ -275,6 +311,7 @@ mod tests {
 
         for event in &captured.events {
             event.validate().expect("valid attributed event");
+            assert_eq!(event.mode, CaptureMode::Task);
             assert!(event.content_digest.starts_with("fnv1a64:"));
             assert!(!event.content_digest.contains(RAW_ARG_MARKER));
             assert!(!event.content_digest.contains(RAW_RESULT_MARKER));
@@ -341,6 +378,25 @@ mod tests {
 
         let captured = capture_hook_payload(&payload).expect("hook payload captures");
         assert_eq!(captured.events[0].tool, "unknown-tool.arguments");
+    }
+
+    #[test]
+    fn passive_mode_state_stamps_adhoc_events_without_extra_task_command() {
+        let state = ModeState::passive();
+        let payload = HookPayloadFields {
+            metadata: HookCaptureMetadata::from_mode_state(4, "run-passive", &state),
+            tool_name: "Read",
+            command: None,
+            arguments: Some("src/lib.rs"),
+            result: None,
+            tokens: TokenCounts::new(1, 0, 0, 0),
+        };
+
+        let events = hook_events_from_payload(&payload).expect("hook payload captures");
+
+        assert_eq!(events[0].mode, CaptureMode::Passive);
+        assert_eq!(events[0].task_id, "adhoc");
+        assert_eq!(events[0].profile_id, "adhoc");
     }
 
     fn fixture_payload() -> HookPayloadFields<'static> {

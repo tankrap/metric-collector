@@ -10,6 +10,7 @@ pub mod hook_calibration;
 pub mod hook_capture;
 pub mod install;
 pub mod metadata;
+pub mod mode;
 pub mod proxy;
 pub mod proxy_attribution;
 pub mod proxy_privacy;

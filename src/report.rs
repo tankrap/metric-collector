@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::core::CaptureMode;
+
 pub type EventClass = String;
 pub type Profile = String;
 pub type RunId = String;
@@ -25,6 +27,7 @@ impl CompletionStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextEvent {
+    pub mode: CaptureMode,
     pub class: EventClass,
     pub context_tokens: TokenCount,
     pub generated: bool,
@@ -107,7 +110,9 @@ pub fn aggregate_report(events: &[ContextEvent]) -> Report {
             .entry(task_key.clone())
             .and_modify(|status| *status = status.merge(event.completion_status))
             .or_insert(event.completion_status);
-        *task_tokens.entry(task_key).or_insert(0) += event.context_tokens;
+        if event.mode == CaptureMode::Task {
+            *task_tokens.entry(task_key).or_insert(0) += event.context_tokens;
+        }
 
         total_context_tokens += event.context_tokens;
         if event.generated {
@@ -138,7 +143,9 @@ pub fn aggregate_report(events: &[ContextEvent]) -> Report {
     let mut completed_task_count = 0;
     let mut completed_task_tokens = 0;
     for (task_key, status) in &task_statuses {
-        if *status == CompletionStatus::Completed && !failed_runs.contains(task_key.run_id.as_str())
+        if *status == CompletionStatus::Completed
+            && !failed_runs.contains(task_key.run_id.as_str())
+            && task_tokens.contains_key(task_key)
         {
             completed_task_count += 1;
             completed_task_tokens += task_tokens.get(task_key).copied().unwrap_or(0);
@@ -200,6 +207,7 @@ mod tests {
         completion_status: CompletionStatus,
     ) -> ContextEvent {
         ContextEvent {
+            mode: CaptureMode::Task,
             run_id: run_id.to_string(),
             task_id: task_id.to_string(),
             profile: profile.to_string(),
@@ -477,6 +485,37 @@ mod tests {
                 500,
                 false,
                 CompletionStatus::Incomplete,
+            ),
+        ]);
+
+        assert_eq!(
+            report.tokens_per_completed_task_excluding_failed_runs,
+            Some(100.0)
+        );
+    }
+
+    #[test]
+    fn passive_events_do_not_affect_tokens_per_completed_task_math() {
+        let mut passive = event(
+            "passive-run",
+            "adhoc",
+            "adhoc",
+            "file.read",
+            10_000,
+            false,
+            CompletionStatus::Completed,
+        );
+        passive.mode = CaptureMode::Passive;
+        let report = aggregate_report(&[
+            passive,
+            event(
+                "task-run",
+                "task-1",
+                "baseline",
+                "file.read",
+                100,
+                false,
+                CompletionStatus::Completed,
             ),
         ]);
 

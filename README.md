@@ -28,37 +28,57 @@ Today the source checkout path is the only implemented path. Static binary,
 their intended commands so tester instructions can stabilize before packaging
 lands.
 
-Planned v1 flow:
+Planned passive-first v1 flow:
 
 ```sh
 vc-tokmeter init
-vc-tokmeter run --profile baseline --task task-id
-vc-tokmeter run --profile treatment --task task-id
-vc-tokmeter report --compare
+vc-tokmeter status
+vc-tokmeter report
 vc-tokmeter report --share
 vc-tokmeter uninstall
 ```
 
-`init` will detect supported agent tooling, install local capture wiring, and
-print exactly what changed and how to remove it. `doctor` will verify the wiring
-and run a short self-test. `report --share` will emit a redacted artifact that a
-tester can manually choose to send.
+Passive mode is the product path: after `init`, capture is local and automatic
+for supported adapters. `status` shows the current mode, events captured today,
+and the top operation class. Task mode is optional lab machinery for controlled
+comparison numbers.
 
-## Baseline and Treatment Runs
+`init` will detect supported agent tooling, install local passive capture
+wiring, print exactly what changed and how to remove it, and include a one-line
+pointer to optional task mode. `doctor` will verify the wiring and run a short
+self-test. `report --share` will emit a redacted artifact that a tester can
+manually choose to send.
 
-The comparison protocol uses a local `tasks.yaml` manifest with realistic tasks
-from the tester's own repository. Each task has a one-line done condition.
-See [docs/tasks.md](docs/tasks.md) and [examples/tasks.yaml](examples/tasks.yaml)
-for a starter template.
+## Producing Comparison Numbers
+
+The comparison protocol is Mode T, the lab path for baseline/treatment numbers.
+It uses a local `tasks.yaml` manifest with realistic tasks from the tester's own
+repository. Each task has a one-line done condition. See
+[docs/tasks.md](docs/tasks.md) and [examples/tasks.yaml](examples/tasks.yaml) for
+a starter template.
+
+Planned Mode T flow:
+
+```sh
+vc-tokmeter run --profile baseline --task task-id
+vc-tokmeter run --profile treatment --task task-id
+vc-tokmeter report --compare
+```
 
 Runs are grouped by profile:
 
 - `baseline`: the tester's existing agent workflow.
 - `treatment`: the same task set using the new stack or capture treatment.
 
-Reports compute headline token metrics over completed runs only and display
-completion rates beside token totals. A treatment that saves tokens by failing
-tasks should be visible as a lower completion rate, not hidden in the math.
+Reports label evidence explicitly:
+
+- Grade O is observational passive data. It can show descriptive before/after
+  deltas but not savings claims.
+- Grade P is controlled Mode T data. It can show tokens-per-completed-task
+  comparisons from completed task runs only.
+
+A treatment that appears cheaper by failing tasks should be visible as a lower
+completion rate, not hidden in the math.
 
 ## Privacy
 

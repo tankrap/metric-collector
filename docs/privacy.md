@@ -31,6 +31,12 @@ operation classes, completion rates, warning labels, salted path/repository
 hashes, and truncated digests. It must not include prompts, source snippets,
 raw tool output, provider credentials, or unhashed private paths.
 
+Passive reports are Grade O evidence: observational workloads were not
+controlled, so differences may reflect changes in the work itself. Grade O
+artifacts can show descriptive deltas, but they must not present savings claims.
+Savings claims require Grade P evidence from the controlled Mode T comparison
+protocol.
+
 ## Network Behavior
 
 v1 has no telemetry phone-home. The proxy adapter may forward the user's own
