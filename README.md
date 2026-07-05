@@ -63,6 +63,12 @@ run Codex through `tokmeter proxy`; see
 [docs/distribution.md](docs/distribution.md#local-proxy-runtime).
 For the study workflow that measures passive AI-assisted git token volume, see
 [docs/study-workflow.md](docs/study-workflow.md).
+For long interactive Codex TUI sessions, use the wrapper so collection runs for
+the full session:
+
+```sh
+cargo run --manifest-path /path/to/metric-collector/Cargo.toml -- codex-tui
+```
 
 Passive mode is the product path. The five-minute setup test measures this
 path: install, initialize local capture, check status, and produce the first

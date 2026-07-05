@@ -1,8 +1,11 @@
 use std::env;
 use std::fs;
 use std::io::{self, Read};
+use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process;
+use std::process::{self, Command};
+use std::thread;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vc_tokmeter::cli_report::{
@@ -22,7 +25,7 @@ use vc_tokmeter::install::{
     UninstallPlan, agent_config_after_init, agent_config_after_uninstall, plan_init,
     plan_uninstall, render_init_summary, render_uninstall_summary,
 };
-use vc_tokmeter::proxy::{ProxyConfig, run_proxy};
+use vc_tokmeter::proxy::{ProxyConfig, run_proxy, serve_proxy_listener};
 use vc_tokmeter::tasks::{Task, TaskManifest};
 
 fn main() {
@@ -41,6 +44,7 @@ fn main() {
         Some("init") => command_init(),
         Some("hook") => command_hook(&args),
         Some("proxy") => command_proxy(&args),
+        Some("codex-tui") => command_codex_tui(&args),
         Some("run") => command_run(&args),
         Some("report") => command_report(&args),
         Some("status") => {
@@ -71,6 +75,7 @@ Commands:
   init       Plan local passive capture wiring
   hook       Execute a local agent hook payload from stdin
   proxy      Run the localhost-only provider proxy
+  codex-tui  Launch interactive Codex through the local proxy
   run        Enter comparison protocol (Mode T) for a task/profile
   report     Generate local Grade O report artifacts
   status     Show current capture mode and today's local summary
@@ -271,6 +276,93 @@ fn command_proxy(args: &[String]) -> Result<(), String> {
     run_proxy(config).map_err(|error| format!("proxy failed: {error}"))
 }
 
+fn command_codex_tui(args: &[String]) -> Result<(), String> {
+    let (session_args, codex_args) = split_passthrough_args(args);
+    let provider = codex_provider(session_args)?;
+    let bind_host = value_after(session_args, "--bind-host").unwrap_or("127.0.0.1");
+    let bind_port = value_after(session_args, "--port")
+        .unwrap_or("17683")
+        .parse::<u16>()
+        .map_err(|error| format!("invalid --port: {error}"))?;
+    let upstream = value_after(session_args, "--upstream").unwrap_or_else(|| provider.upstream());
+    let event_log = value_after(session_args, "--event-log")
+        .map(PathBuf::from)
+        .unwrap_or(default_event_log_path()?);
+    let report_out = value_after(session_args, "--out")
+        .map(PathBuf::from)
+        .unwrap_or(current_dir()?.join(".tokmeter").join("report"));
+    let codex_bin = value_after(session_args, "--codex-bin").unwrap_or("codex");
+    let keep_openai_api_key = has_flag(session_args, "--keep-openai-api-key");
+
+    if let Some(parent) = event_log.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    }
+
+    let config = ProxyConfig::new(bind_host, bind_port, upstream)
+        .map_err(|error| error.to_string())?
+        .with_event_log_path(event_log.clone());
+    let listener = TcpListener::bind((config.bind_host.as_str(), config.bind_port))
+        .map_err(|error| format!("cannot bind proxy: {error}"))?;
+    let base_override = provider.base_override(&config.bind_host, config.bind_port);
+    let proxy_config = config.clone();
+
+    println!(
+        "tokmeter proxy listening on {}:{} -> {}",
+        config.bind_host, config.bind_port, config.upstream_url
+    );
+    println!("tokmeter event log: {}", event_log.display());
+    println!(
+        "codex config override: {}=\"{}\"",
+        base_override.key, base_override.value
+    );
+    println!(
+        "report while Codex is running: vc-tokmeter report --event-log {} --out {}",
+        event_log.display(),
+        report_out.display()
+    );
+
+    thread::spawn(move || {
+        if let Err(error) = serve_proxy_listener(proxy_config, listener) {
+            eprintln!("tokmeter proxy failed: {error}");
+        }
+    });
+    thread::sleep(Duration::from_millis(150));
+
+    let mut command = Command::new(codex_bin);
+    command
+        .arg("-c")
+        .arg(format!("{}=\"{}\"", base_override.key, base_override.value));
+    command.args(codex_args);
+    if provider == CodexProvider::ChatGpt && !keep_openai_api_key {
+        command.env_remove("OPENAI_API_KEY");
+    }
+
+    let status = command
+        .status()
+        .map_err(|error| format!("cannot launch {codex_bin}: {error}"))?;
+
+    match create_first_report_artifacts(&report_out, Some(event_log.as_path())) {
+        Ok(artifacts) => {
+            println!("{}", render_report_output_paths(&artifacts.paths));
+            println!("Evidence: Grade O observational; no savings headline is emitted.");
+        }
+        Err(error) => eprintln!("cannot create report artifacts: {error}"),
+    }
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "codex exited with {}",
+            status
+                .code()
+                .map(|code| format!("code {code}"))
+                .unwrap_or_else(|| "signal".to_owned())
+        ))
+    }
+}
+
 fn default_init_request() -> Result<InitRequest, String> {
     let cwd = current_dir()?;
     InitRequest::new(
@@ -391,6 +483,57 @@ fn remove_dir_if_empty(path: PathBuf) -> Result<(), String> {
 
 fn current_dir() -> Result<PathBuf, String> {
     env::current_dir().map_err(|error| format!("cannot read current directory: {error}"))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexProvider {
+    ChatGpt,
+    Api,
+}
+
+impl CodexProvider {
+    fn upstream(self) -> &'static str {
+        match self {
+            Self::ChatGpt => "https://chatgpt.com/backend-api",
+            Self::Api => "https://api.openai.com",
+        }
+    }
+
+    fn base_override(self, bind_host: &str, bind_port: u16) -> CodexBaseOverride {
+        match self {
+            Self::ChatGpt => CodexBaseOverride {
+                key: "chatgpt_base_url",
+                value: format!("http://{bind_host}:{bind_port}/backend-api/"),
+            },
+            Self::Api => CodexBaseOverride {
+                key: "openai_base_url",
+                value: format!("http://{bind_host}:{bind_port}/v1"),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CodexBaseOverride {
+    key: &'static str,
+    value: String,
+}
+
+fn codex_provider(args: &[String]) -> Result<CodexProvider, String> {
+    match value_after(args, "--provider").unwrap_or("chatgpt") {
+        "chatgpt" | "subscription" => Ok(CodexProvider::ChatGpt),
+        "api" | "platform" => Ok(CodexProvider::Api),
+        value => Err(format!(
+            "invalid --provider: {value}; expected chatgpt or api"
+        )),
+    }
+}
+
+fn split_passthrough_args(args: &[String]) -> (&[String], &[String]) {
+    match args.iter().position(|arg| arg == "--") {
+        Some(index) => (&args[..index], &args[index + 1..]),
+        None => (args, &[]),
+    }
 }
 
 fn default_event_log_path() -> Result<PathBuf, String> {
@@ -545,5 +688,50 @@ fn default_task_manifest() -> TaskManifest {
                 done: false,
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn codex_tui_defaults_to_chatgpt_subscription_proxy() {
+        let provider = codex_provider(&[]).unwrap();
+        let base = provider.base_override("127.0.0.1", 17683);
+
+        assert_eq!(provider.upstream(), "https://chatgpt.com/backend-api");
+        assert_eq!(base.key, "chatgpt_base_url");
+        assert_eq!(base.value, "http://127.0.0.1:17683/backend-api/");
+    }
+
+    #[test]
+    fn codex_tui_supports_platform_api_proxy() {
+        let provider = codex_provider(&args(&["--provider", "api"])).unwrap();
+        let base = provider.base_override("localhost", 48123);
+
+        assert_eq!(provider.upstream(), "https://api.openai.com");
+        assert_eq!(base.key, "openai_base_url");
+        assert_eq!(base.value, "http://localhost:48123/v1");
+    }
+
+    #[test]
+    fn codex_tui_splits_passthrough_args_after_double_dash() {
+        let input = args(&[
+            "--event-log",
+            ".tokmeter/events.jsonl",
+            "--",
+            "--model",
+            "gpt-5.5",
+            "initial prompt",
+        ]);
+        let (session_args, codex_args) = split_passthrough_args(&input);
+
+        assert_eq!(session_args, &input[..2]);
+        assert_eq!(codex_args, &input[3..]);
     }
 }

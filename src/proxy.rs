@@ -245,7 +245,10 @@ pub fn parse_http_request(raw_request: &str) -> Result<ProxyHttpRequest, ProxyRu
 
 pub fn run_proxy(config: ProxyConfig) -> io::Result<()> {
     let listener = TcpListener::bind((config.bind_host.as_str(), config.bind_port))?;
+    serve_proxy_listener(config, listener)
+}
 
+pub fn serve_proxy_listener(config: ProxyConfig, listener: TcpListener) -> io::Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {

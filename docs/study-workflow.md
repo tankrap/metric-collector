@@ -25,8 +25,41 @@ events such as file reads, edits, test output, and git commands. They store
 counts, operation classes, byte counts, and digests, not prompts, source code,
 or raw tool output.
 
-For richer token measurement, also run the local proxy in a separate terminal.
-For Codex with a ChatGPT subscription login:
+For richer token measurement with a long interactive Codex TUI session, launch
+Codex through the tokmeter wrapper:
+
+```sh
+cargo run --manifest-path /Users/justin/metrics/Cargo.toml -- codex-tui
+```
+
+This starts the local proxy, launches the normal interactive `codex` TUI in the
+same terminal, points Codex at the proxy, continuously appends events to
+`.tokmeter/events.jsonl`, and writes a report when Codex exits. While Codex is
+still running, you can generate an interim report from another terminal:
+
+```sh
+cargo run --manifest-path /Users/justin/metrics/Cargo.toml -- report \
+  --event-log .tokmeter/events.jsonl \
+  --out .tokmeter/report
+```
+
+Pass Codex TUI arguments after `--`:
+
+```sh
+cargo run --manifest-path /Users/justin/metrics/Cargo.toml -- codex-tui -- \
+  --model gpt-5.5
+```
+
+For Codex with a Platform API key instead of subscription auth:
+
+```sh
+cargo run --manifest-path /Users/justin/metrics/Cargo.toml -- codex-tui \
+  --provider api \
+  --keep-openai-api-key
+```
+
+If you prefer to manage terminals yourself, you can still run the proxy
+directly in one terminal and Codex in another:
 
 ```sh
 cargo run --manifest-path /Users/justin/metrics/Cargo.toml -- proxy \
@@ -36,16 +69,10 @@ cargo run --manifest-path /Users/justin/metrics/Cargo.toml -- proxy \
   --event-log .tokmeter/events.jsonl
 ```
 
-Then start Codex through the proxy:
-
 ```sh
 unset OPENAI_API_KEY
 codex -c chatgpt_base_url='"http://127.0.0.1:17683/backend-api/"'
 ```
-
-For Codex with a Platform API key instead of subscription auth, use
-`--upstream https://api.openai.com` and
-`-c openai_base_url='"http://127.0.0.1:17683/v1"'`.
 
 Now work normally: ask the agent to inspect `git status`, review diffs, edit
 files, run tests, and prepare commits. Stop the proxy after the session ends.
