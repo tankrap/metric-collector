@@ -7,7 +7,9 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tungstenite::client::IntoClientRequest;
-use tungstenite::{Message, accept, connect};
+use tungstenite::handshake::derive_accept_key;
+use tungstenite::protocol::{Role, WebSocket};
+use tungstenite::{Message, connect};
 
 use crate::core::{AttributedTokenEvent, EventLog, EventLogError, OperationClass, TokenCounts};
 use crate::digest::digest_bytes;
@@ -235,7 +237,14 @@ pub fn run_proxy(config: ProxyConfig) -> io::Result<()> {
     let listener = TcpListener::bind((config.bind_host.as_str(), config.bind_port))?;
 
     for stream in listener.incoming() {
-        serve_proxy_connection(stream?, &config)?;
+        match stream {
+            Ok(stream) => {
+                if let Err(error) = serve_proxy_connection(stream, &config) {
+                    eprintln!("proxy connection failed: {error}");
+                }
+            }
+            Err(error) => eprintln!("proxy accept failed: {error}"),
+        }
     }
 
     Ok(())
@@ -290,7 +299,7 @@ fn serve_proxy_connection(mut stream: TcpStream, config: &ProxyConfig) -> io::Re
 }
 
 fn serve_websocket_proxy_connection(
-    stream: TcpStream,
+    mut stream: TcpStream,
     config: &ProxyConfig,
     raw_request: &str,
 ) -> io::Result<()> {
@@ -305,11 +314,23 @@ fn serve_websocket_proxy_connection(
 
     copy_websocket_forward_headers(&request.headers, upstream_request.headers_mut())?;
 
-    let mut local_ws = accept(stream).map_err(handshake_io_error)?;
+    let (mut upstream_ws, upstream_response) = match connect(upstream_request) {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            return write_proxy_error_response(
+                &mut stream,
+                ProxyRuntimeError::Io {
+                    message: redact_provider_error(&error.to_string()),
+                },
+            );
+        }
+    };
+
+    write_websocket_upgrade_response(&mut stream, &request, upstream_response.headers())?;
+    let mut local_ws = WebSocket::from_raw_socket(stream, Role::Server, None);
     local_ws
         .get_mut()
         .set_read_timeout(Some(Duration::from_millis(150)))?;
-    let (mut upstream_ws, _) = connect(upstream_request).map_err(websocket_io_error)?;
     forward_initial_websocket_client_messages(&mut local_ws, &mut upstream_ws)?;
     relay_upstream_websocket_messages(&mut upstream_ws, &mut local_ws, config)
 }
@@ -435,6 +456,41 @@ fn copy_websocket_forward_headers(
     Ok(())
 }
 
+fn write_websocket_upgrade_response(
+    mut stream: impl Write,
+    request: &ProxyHttpRequest,
+    upstream_headers: &tungstenite::http::HeaderMap,
+) -> io::Result<()> {
+    let Some(key) = header_value(&request.headers, "sec-websocket-key") else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing Sec-WebSocket-Key header",
+        ));
+    };
+
+    write!(
+        stream,
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n",
+        derive_accept_key(key.as_bytes())
+    )?;
+
+    if let Some(protocol) = upstream_headers
+        .get("sec-websocket-protocol")
+        .and_then(|value| value.to_str().ok())
+    {
+        write!(stream, "Sec-WebSocket-Protocol: {protocol}\r\n")?;
+    }
+
+    stream.write_all(b"\r\n")
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
 fn is_hop_by_hop_websocket_header(name: &str) -> bool {
     name.eq_ignore_ascii_case("host")
         || name.eq_ignore_ascii_case("connection")
@@ -442,14 +498,9 @@ fn is_hop_by_hop_websocket_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("sec-websocket-key")
         || name.eq_ignore_ascii_case("sec-websocket-version")
         || name.eq_ignore_ascii_case("sec-websocket-extensions")
-        || name.eq_ignore_ascii_case("sec-websocket-protocol")
 }
 
 fn websocket_io_error(error: tungstenite::Error) -> io::Error {
-    io::Error::other(redact_provider_error(&error.to_string()))
-}
-
-fn handshake_io_error(error: impl fmt::Display) -> io::Error {
     io::Error::other(redact_provider_error(&error.to_string()))
 }
 
@@ -1443,6 +1494,32 @@ mod tests {
         assert!(persisted.contains("input_tokens=31"));
         assert!(persisted.contains("output_tokens=7"));
         assert!(!persisted.contains("PRIVATE_CONTENT_FIXTURE"));
+    }
+
+    #[test]
+    fn websocket_upgrade_response_uses_consumed_request_handshake() {
+        let request = parse_http_request(concat!(
+            "GET /v1/responses HTTP/1.1\r\n",
+            "Host: 127.0.0.1:17683\r\n",
+            "Connection: Upgrade\r\n",
+            "Upgrade: websocket\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "\r\n"
+        ))
+        .unwrap();
+        let mut upstream_headers = tungstenite::http::HeaderMap::new();
+        upstream_headers.insert(
+            "sec-websocket-protocol",
+            tungstenite::http::HeaderValue::from_static("fixture-protocol"),
+        );
+        let mut response = Vec::new();
+
+        write_websocket_upgrade_response(&mut response, &request, &upstream_headers).unwrap();
+
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+        assert!(response.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"));
+        assert!(response.contains("Sec-WebSocket-Protocol: fixture-protocol\r\n"));
     }
 
     #[test]
