@@ -1,6 +1,8 @@
 use std::fmt;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::core::{AttributedTokenEvent, EventLog, EventLogError, OperationClass, TokenCounts};
@@ -17,6 +19,7 @@ pub struct ProxyConfig {
     pub bind_host: String,
     pub bind_port: u16,
     pub upstream_url: String,
+    pub event_log_path: Option<PathBuf>,
 }
 
 impl ProxyConfig {
@@ -35,7 +38,13 @@ impl ProxyConfig {
             bind_host,
             bind_port,
             upstream_url: upstream_url.into(),
+            event_log_path: None,
         })
+    }
+
+    pub fn with_event_log_path(mut self, event_log_path: impl Into<PathBuf>) -> Self {
+        self.event_log_path = Some(event_log_path.into());
+        self
     }
 }
 
@@ -99,7 +108,7 @@ impl fmt::Display for ProxyRuntimeError {
             }
             Self::UnsupportedUpstreamScheme { scheme } => write!(
                 f,
-                "proxy upstream scheme must be http for the stdlib runtime primitive; got {scheme:?}"
+                "proxy upstream scheme must be http or https; got {scheme:?}"
             ),
             Self::MissingUpstreamHost { upstream_url } => {
                 write!(
@@ -259,9 +268,29 @@ pub fn forward_proxy_request_with_mode(
 fn serve_proxy_connection(mut stream: TcpStream, config: &ProxyConfig) -> io::Result<()> {
     let request = read_http_like_request(&mut stream)?;
     match forward_proxy_request(config, &request) {
-        Ok(exchange) => stream.write_all(&exchange.response_bytes),
+        Ok(exchange) => {
+            if let Some(event_log_path) = &config.event_log_path {
+                append_proxy_event_log_records(
+                    event_log_path,
+                    &exchange.capture.event_log_records,
+                )?;
+            }
+            stream.write_all(&exchange.response_bytes)
+        }
         Err(error) => write_proxy_error_response(&mut stream, error),
     }
+}
+
+fn append_proxy_event_log_records(path: &PathBuf, records: &[u8]) -> io::Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(records)
 }
 
 fn read_http_like_request(stream: &mut impl Read) -> io::Result<String> {
@@ -319,6 +348,7 @@ fn content_length(header_text: &str) -> Option<usize> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedUpstream {
+    scheme: String,
     host: String,
     port: u16,
     base_path: String,
@@ -333,7 +363,7 @@ impl ParsedUpstream {
             });
         };
 
-        if scheme != "http" {
+        if !matches!(scheme, "http" | "https") {
             return Err(ProxyRuntimeError::UnsupportedUpstreamScheme {
                 scheme: scheme.to_owned(),
             });
@@ -346,14 +376,16 @@ impl ParsedUpstream {
             });
         }
 
-        let (host, port) = parse_authority(authority)?;
-        let host_header = if port == 80 {
+        let default_port = if scheme == "https" { 443 } else { 80 };
+        let (host, port) = parse_authority(authority, default_port)?;
+        let host_header = if port == default_port {
             host.clone()
         } else {
             format!("{host}:{port}")
         };
 
         Ok(Self {
+            scheme: scheme.to_owned(),
             host,
             port,
             base_path: normalize_base_path(path),
@@ -364,9 +396,18 @@ impl ParsedUpstream {
     fn target_for_request_path(&self, request_path: &str) -> String {
         join_paths(&self.base_path, request_path)
     }
+
+    fn target_url_for_request_path(&self, request_path: &str) -> String {
+        format!(
+            "{}://{}{}",
+            self.scheme,
+            self.host_header,
+            self.target_for_request_path(request_path)
+        )
+    }
 }
 
-fn parse_authority(authority: &str) -> Result<(String, u16), ProxyRuntimeError> {
+fn parse_authority(authority: &str, default_port: u16) -> Result<(String, u16), ProxyRuntimeError> {
     if authority.starts_with('[') {
         let Some(host_end) = authority.find(']') else {
             return Err(ProxyRuntimeError::MissingUpstreamHost {
@@ -379,13 +420,13 @@ fn parse_authority(authority: &str) -> Result<(String, u16), ProxyRuntimeError> 
             .and_then(|suffix| suffix.strip_prefix(':'))
             .map(parse_port)
             .transpose()?
-            .unwrap_or(80);
+            .unwrap_or(default_port);
         return Ok((host, port));
     }
 
     let (host, port) = match authority.rsplit_once(':') {
         Some((host, port)) => (host.to_owned(), parse_port(port)?),
-        None => (authority.to_owned(), 80),
+        None => (authority.to_owned(), default_port),
     };
 
     if host.is_empty() {
@@ -486,6 +527,10 @@ fn build_upstream_request(
 }
 
 fn send_upstream_request(upstream: &ParsedUpstream, request: &[u8]) -> io::Result<Vec<u8>> {
+    if upstream.scheme == "https" {
+        return send_https_upstream_request(upstream, request);
+    }
+
     let mut stream = TcpStream::connect((upstream.host.as_str(), upstream.port))?;
     stream.write_all(request)?;
     stream.flush()?;
@@ -493,6 +538,78 @@ fn send_upstream_request(upstream: &ParsedUpstream, request: &[u8]) -> io::Resul
     let mut response = Vec::new();
     stream.read_to_end(&mut response)?;
     Ok(response)
+}
+
+fn send_https_upstream_request(upstream: &ParsedUpstream, request: &[u8]) -> io::Result<Vec<u8>> {
+    let raw_request = String::from_utf8_lossy(request);
+    let parsed = parse_http_request(&raw_request)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let url = upstream.target_url_for_request_path(&parsed.path);
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .map_err(reqwest_io_error)?;
+    let method = reqwest::Method::from_bytes(parsed.method.as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let mut request_builder = client.request(method, url);
+
+    for (name, value) in parsed.headers {
+        if name.eq_ignore_ascii_case("host")
+            || name.eq_ignore_ascii_case("connection")
+            || name.eq_ignore_ascii_case("proxy-connection")
+            || name.eq_ignore_ascii_case("content-length")
+        {
+            continue;
+        }
+        request_builder = request_builder.header(name, value);
+    }
+
+    let response = request_builder
+        .body(parsed.body)
+        .send()
+        .map_err(reqwest_io_error)?;
+    render_reqwest_response(response)
+}
+
+fn render_reqwest_response(response: reqwest::blocking::Response) -> io::Result<Vec<u8>> {
+    let status = response.status();
+    let mut output = Vec::new();
+    write!(
+        output,
+        "HTTP/1.1 {} {}\r\n",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("")
+    )?;
+
+    let headers = response.headers().clone();
+    let body = response.bytes().map_err(reqwest_io_error)?;
+    let mut saw_content_length = false;
+
+    for (name, value) in &headers {
+        if name.as_str().eq_ignore_ascii_case("connection")
+            || name.as_str().eq_ignore_ascii_case("transfer-encoding")
+        {
+            continue;
+        }
+        if name.as_str().eq_ignore_ascii_case("content-length") {
+            saw_content_length = true;
+        }
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        write!(output, "{}: {}\r\n", name.as_str(), value)?;
+    }
+
+    if !saw_content_length {
+        write!(output, "content-length: {}\r\n", body.len())?;
+    }
+    output.extend_from_slice(b"connection: close\r\n\r\n");
+    output.extend_from_slice(&body);
+    Ok(output)
+}
+
+fn reqwest_io_error(error: reqwest::Error) -> io::Error {
+    io::Error::other(redact_provider_error(&error.to_string()))
 }
 
 fn response_body_string(response_bytes: &[u8]) -> String {
@@ -1070,6 +1187,32 @@ mod tests {
         assert_eq!(
             parsed.events[0].operation_class,
             crate::core::OperationClass::Other
+        );
+    }
+
+    #[test]
+    fn https_upstream_defaults_to_tls_port_and_builds_target_url() {
+        let upstream = ParsedUpstream::parse("https://api.openai.com/v1").unwrap();
+
+        assert_eq!(upstream.scheme, "https");
+        assert_eq!(upstream.host, "api.openai.com");
+        assert_eq!(upstream.port, 443);
+        assert_eq!(upstream.host_header, "api.openai.com");
+        assert_eq!(
+            upstream.target_url_for_request_path("/responses"),
+            "https://api.openai.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn proxy_config_can_carry_event_log_path_for_runtime_persistence() {
+        let config = ProxyConfig::new("127.0.0.1", 17683, "https://api.openai.com/v1")
+            .unwrap()
+            .with_event_log_path("/tmp/tokmeter-proxy-events.jsonl");
+
+        assert_eq!(
+            config.event_log_path,
+            Some(std::path::PathBuf::from("/tmp/tokmeter-proxy-events.jsonl"))
         );
     }
 

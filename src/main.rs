@@ -257,11 +257,17 @@ fn command_proxy(args: &[String]) -> Result<(), String> {
         .map_err(|error| format!("invalid --port: {error}"))?;
     let upstream = value_after(args, "--upstream")
         .ok_or_else(|| "--upstream is required for proxy".to_owned())?;
-    let config = ProxyConfig::new(bind_host, bind_port, upstream).map_err(|e| e.to_string())?;
+    let event_log = value_after(args, "--event-log")
+        .map(PathBuf::from)
+        .unwrap_or(default_event_log_path()?);
+    let config = ProxyConfig::new(bind_host, bind_port, upstream)
+        .map_err(|e| e.to_string())?
+        .with_event_log_path(event_log.clone());
     println!(
         "proxy listening on {}:{} -> {}",
         config.bind_host, config.bind_port, config.upstream_url
     );
+    println!("proxy event log: {}", event_log.display());
     run_proxy(config).map_err(|error| format!("proxy failed: {error}"))
 }
 

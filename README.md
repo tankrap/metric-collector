@@ -58,6 +58,10 @@ cargo run --manifest-path /path/to/metric-collector/Cargo.toml -- report \
   --out .tokmeter/report
 ```
 
+To capture provider-reported token counts instead of hook byte/digest evidence,
+run Codex through `tokmeter proxy`; see
+[docs/distribution.md](docs/distribution.md#local-proxy-runtime).
+
 Passive mode is the product path. The five-minute setup test measures this
 path: install, initialize local capture, check status, and produce the first
 local report. Current source-checkout reports use Grade O self-report fixture
