@@ -641,6 +641,9 @@ fn format_percent(value: f64) -> String {
     if !value.is_finite() {
         return "n/a".to_owned();
     }
+    if value > 0.0 && value < 0.001 {
+        return "<0.1%".to_owned();
+    }
     format!("{:.1}%", value * 100.0)
 }
 
@@ -948,6 +951,11 @@ mod tests {
 
         assert!(markdown.contains("| Total tokens | Grade O | 0 | 100 | -100 (n/a) |"));
         assert!(markdown.contains("| Tasks | n/a (0/0) | n/a (0/0) | n/a |"));
+    }
+
+    #[test]
+    fn renders_tiny_nonzero_percentages_as_less_than_point_one_percent() {
+        assert_eq!(format_percent(0.000_141), "<0.1%");
     }
 
     #[test]
