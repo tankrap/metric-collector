@@ -191,6 +191,12 @@ fn event_log_report_json(events: &[AttributedTokenEvent]) -> String {
             share: ratio_or_zero(*tokens, aggregate.totals.total_tokens),
         })
         .collect::<Vec<_>>();
+    let git_workflow_rows = aggregate.git_workflow_json_rows();
+    let git_workflow = aggregate.git_workflow_json(&git_workflow_rows);
+    let token_source_rows = aggregate.token_source_json_rows();
+    let token_sources = report_json::TokenSourceBreakdown {
+        rows: &token_source_rows,
+    };
     let warnings = [EVENT_LOG_REPORT_WARNING];
 
     report_json::serialize_report_json(&report_json::ReportJson {
@@ -198,6 +204,8 @@ fn event_log_report_json(events: &[AttributedTokenEvent]) -> String {
         totals: aggregate.totals,
         run_profile_totals: &run_profile_totals,
         class_shares: &class_shares,
+        token_sources,
+        git_workflow,
         completion_rates: aggregate.completion_rates(),
         comparison: None,
         repeat_metrics: aggregate.repeat_metrics(),
@@ -215,6 +223,12 @@ fn event_log_report_json(events: &[AttributedTokenEvent]) -> String {
 
 fn event_log_report_markdown(events: &[AttributedTokenEvent]) -> String {
     let aggregate = EventLogAggregate::from_events(events);
+    let git_workflow_rows = aggregate.git_workflow_markdown_rows();
+    let git_workflow = aggregate.git_workflow_markdown(&git_workflow_rows);
+    let token_source_rows = aggregate.token_source_markdown_rows();
+    let token_sources = report_markdown::TokenSourceSummary {
+        rows: &token_source_rows,
+    };
     let warnings = [EVENT_LOG_REPORT_WARNING];
 
     report_markdown::serialize_report_markdown(&report_markdown::MarkdownReport {
@@ -236,6 +250,8 @@ fn event_log_report_markdown(events: &[AttributedTokenEvent]) -> String {
                 runs: completion_rate_to_markdown(aggregate.completion_rates().runs),
             },
             token_distribution: None,
+            token_sources: Some(token_sources),
+            git_workflow: Some(git_workflow),
         }),
         comparison: None,
         warnings: &warnings,
@@ -262,6 +278,12 @@ fn compare_report_json(compare: &CompareReportAggregate) -> String {
         })
         .collect::<Vec<_>>();
     let rows = compare.comparison_rows();
+    let git_workflow_rows = compare.git_workflow_json_rows();
+    let git_workflow = compare.git_workflow_json(&git_workflow_rows);
+    let token_source_rows = compare.token_source_json_rows();
+    let token_sources = report_json::TokenSourceBreakdown {
+        rows: &token_source_rows,
+    };
     let warnings = [COMPARE_REPORT_WARNING];
 
     report_json::serialize_report_json(&report_json::ReportJson {
@@ -269,6 +291,8 @@ fn compare_report_json(compare: &CompareReportAggregate) -> String {
         totals: compare.totals,
         run_profile_totals: &run_profile_totals,
         class_shares: &class_shares,
+        token_sources,
+        git_workflow,
         completion_rates: compare.completion_rates(),
         comparison: Some(report_json::CompareSummary {
             baseline_profile_id: BASELINE_PROFILE_ID,
@@ -396,6 +420,8 @@ struct CompareReportAggregate {
     completed_task_tokens: BTreeMap<String, Vec<u64>>,
     repeat_event_count: u64,
     repeat_tokens: u64,
+    token_sources: TokenSourceAggregate,
+    git_workflow: GitWorkflowAggregate,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -433,6 +459,8 @@ impl CompareReportAggregate {
         let mut totals = report_json::Totals::default();
         let mut repeat_event_count = 0u64;
         let mut repeat_tokens = 0u64;
+        let mut token_sources = TokenSourceAggregate::default();
+        let mut git_workflow = GitWorkflowAggregate::default();
         let completed_keys = completed_runs
             .iter()
             .filter(|record| record.status == RunCompletionStatus::Completed)
@@ -483,6 +511,8 @@ impl CompareReportAggregate {
             *class_totals
                 .entry(event.operation_class.as_str().to_owned())
                 .or_insert(0) += total_tokens;
+            token_sources.add_event(event, total_tokens);
+            git_workflow.add_event(event, total_tokens);
 
             if event.repeat_of.is_some() {
                 repeat_event_count = repeat_event_count.saturating_add(1);
@@ -547,6 +577,8 @@ impl CompareReportAggregate {
             completed_task_tokens,
             repeat_event_count,
             repeat_tokens,
+            token_sources,
+            git_workflow,
         })
     }
 
@@ -635,6 +667,21 @@ impl CompareReportAggregate {
             },
         }
     }
+
+    fn git_workflow_json_rows(&self) -> Vec<report_json::GitWorkflowRow<'_>> {
+        self.git_workflow.json_rows(self.totals.total_tokens)
+    }
+
+    fn token_source_json_rows(&self) -> Vec<report_json::TokenSourceRow<'_>> {
+        self.token_sources.json_rows(self.totals.total_tokens)
+    }
+
+    fn git_workflow_json<'a>(
+        &self,
+        rows: &'a [report_json::GitWorkflowRow<'a>],
+    ) -> report_json::GitWorkflowBreakdown<'a> {
+        self.git_workflow.to_json(self.totals.total_tokens, rows)
+    }
 }
 
 impl CompareCompletionAggregate {
@@ -700,6 +747,8 @@ struct EventLogAggregate {
     profile_label: String,
     repeat_event_count: u64,
     repeat_tokens: u64,
+    token_sources: TokenSourceAggregate,
+    git_workflow: GitWorkflowAggregate,
 }
 
 impl EventLogAggregate {
@@ -713,6 +762,8 @@ impl EventLogAggregate {
         let mut totals = report_json::Totals::default();
         let mut repeat_event_count = 0u64;
         let mut repeat_tokens = 0u64;
+        let mut token_sources = TokenSourceAggregate::default();
+        let mut git_workflow = GitWorkflowAggregate::default();
 
         for event in events {
             let total_tokens = event.tokens.total().unwrap_or(u64::MAX);
@@ -750,6 +801,8 @@ impl EventLogAggregate {
             *class_totals
                 .entry(event.operation_class.as_str().to_owned())
                 .or_insert(0) += total_tokens;
+            token_sources.add_event(event, total_tokens);
+            git_workflow.add_event(event, total_tokens);
 
             if event.repeat_of.is_some() {
                 repeat_event_count = repeat_event_count.saturating_add(1);
@@ -787,6 +840,8 @@ impl EventLogAggregate {
             profile_label,
             repeat_event_count,
             repeat_tokens,
+            token_sources,
+            git_workflow,
         }
     }
 
@@ -831,6 +886,209 @@ impl EventLogAggregate {
             cache_tokens,
             cache_token_share: ratio_or_zero(cache_tokens, self.totals.total_tokens),
         }
+    }
+
+    fn git_workflow_json_rows(&self) -> Vec<report_json::GitWorkflowRow<'_>> {
+        self.git_workflow.json_rows(self.totals.total_tokens)
+    }
+
+    fn token_source_json_rows(&self) -> Vec<report_json::TokenSourceRow<'_>> {
+        self.token_sources.json_rows(self.totals.total_tokens)
+    }
+
+    fn git_workflow_json<'a>(
+        &self,
+        rows: &'a [report_json::GitWorkflowRow<'a>],
+    ) -> report_json::GitWorkflowBreakdown<'a> {
+        self.git_workflow.to_json(self.totals.total_tokens, rows)
+    }
+
+    fn git_workflow_markdown_rows(&self) -> Vec<report_markdown::GitWorkflowRow<'_>> {
+        self.git_workflow.markdown_rows(self.totals.total_tokens)
+    }
+
+    fn token_source_markdown_rows(&self) -> Vec<report_markdown::TokenSourceRow<'_>> {
+        self.token_sources.markdown_rows(self.totals.total_tokens)
+    }
+
+    fn git_workflow_markdown<'a>(
+        &self,
+        rows: &'a [report_markdown::GitWorkflowRow<'a>],
+    ) -> report_markdown::GitWorkflowSummary<'a> {
+        report_markdown::GitWorkflowSummary {
+            event_count: self.git_workflow.totals.event_count,
+            input_tokens: self.git_workflow.totals.input_tokens,
+            output_tokens: self.git_workflow.totals.output_tokens,
+            cache_read_tokens: self.git_workflow.totals.cache_read_tokens,
+            cache_write_tokens: self.git_workflow.totals.cache_write_tokens,
+            total_tokens: self.git_workflow.totals.total_tokens,
+            byte_count: self.git_workflow.totals.byte_count,
+            token_share: ratio_or_zero(
+                self.git_workflow.totals.total_tokens,
+                self.totals.total_tokens,
+            ),
+            rows,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct TokenSourceAggregate {
+    rows: BTreeMap<String, report_json::Totals>,
+}
+
+impl TokenSourceAggregate {
+    fn add_event(&mut self, event: &AttributedTokenEvent, total_tokens: u64) {
+        let source = token_source_label(event).to_owned();
+        add_to_totals(self.rows.entry(source).or_default(), event, total_tokens);
+    }
+
+    fn json_rows(&self, total_tokens: u64) -> Vec<report_json::TokenSourceRow<'_>> {
+        self.rows
+            .iter()
+            .map(|(source, totals)| report_json::TokenSourceRow {
+                source: source.as_str(),
+                totals: *totals,
+                token_share: ratio_or_zero(totals.total_tokens, total_tokens),
+            })
+            .collect()
+    }
+
+    fn markdown_rows(&self, total_tokens: u64) -> Vec<report_markdown::TokenSourceRow<'_>> {
+        self.rows
+            .iter()
+            .map(|(source, totals)| report_markdown::TokenSourceRow {
+                source: source.as_str(),
+                event_count: totals.event_count,
+                input_tokens: totals.input_tokens,
+                output_tokens: totals.output_tokens,
+                cache_read_tokens: totals.cache_read_tokens,
+                cache_write_tokens: totals.cache_write_tokens,
+                total_tokens: totals.total_tokens,
+                byte_count: totals.byte_count,
+                token_share: ratio_or_zero(totals.total_tokens, total_tokens),
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct GitWorkflowAggregate {
+    totals: report_json::Totals,
+    rows: BTreeMap<(String, String, String), report_json::Totals>,
+}
+
+impl GitWorkflowAggregate {
+    fn add_event(&mut self, event: &AttributedTokenEvent, total_tokens: u64) {
+        if !event.operation_class.as_str().starts_with("vc.") {
+            return;
+        }
+
+        add_to_totals(&mut self.totals, event, total_tokens);
+        let action_subtype = git_action_subtype(event).to_owned();
+        let direction = event_direction(event).to_owned();
+        add_to_totals(
+            self.rows
+                .entry((
+                    action_subtype,
+                    direction,
+                    event.operation_class.as_str().to_owned(),
+                ))
+                .or_default(),
+            event,
+            total_tokens,
+        );
+    }
+
+    fn to_json<'a>(
+        &self,
+        total_tokens: u64,
+        rows: &'a [report_json::GitWorkflowRow<'a>],
+    ) -> report_json::GitWorkflowBreakdown<'a> {
+        report_json::GitWorkflowBreakdown {
+            totals: self.totals,
+            token_share: ratio_or_zero(self.totals.total_tokens, total_tokens),
+            rows,
+        }
+    }
+
+    fn json_rows(&self, total_tokens: u64) -> Vec<report_json::GitWorkflowRow<'_>> {
+        self.rows
+            .iter()
+            .map(|((action_subtype, direction, operation_class), totals)| {
+                report_json::GitWorkflowRow {
+                    action_subtype: action_subtype.as_str(),
+                    direction: direction.as_str(),
+                    operation_class: operation_class.as_str(),
+                    totals: *totals,
+                    token_share: ratio_or_zero(totals.total_tokens, total_tokens),
+                }
+            })
+            .collect()
+    }
+
+    fn markdown_rows(&self, total_tokens: u64) -> Vec<report_markdown::GitWorkflowRow<'_>> {
+        self.rows
+            .iter()
+            .map(|((action_subtype, direction, operation_class), totals)| {
+                report_markdown::GitWorkflowRow {
+                    action_subtype: action_subtype.as_str(),
+                    direction: direction.as_str(),
+                    operation_class: operation_class.as_str(),
+                    event_count: totals.event_count,
+                    input_tokens: totals.input_tokens,
+                    output_tokens: totals.output_tokens,
+                    cache_read_tokens: totals.cache_read_tokens,
+                    cache_write_tokens: totals.cache_write_tokens,
+                    total_tokens: totals.total_tokens,
+                    byte_count: totals.byte_count,
+                    token_share: ratio_or_zero(totals.total_tokens, total_tokens),
+                }
+            })
+            .collect()
+    }
+}
+
+fn git_action_subtype(event: &AttributedTokenEvent) -> &str {
+    event.action_subtype.as_deref().unwrap_or_else(|| {
+        event
+            .operation_class
+            .as_str()
+            .strip_prefix("vc.")
+            .unwrap_or_else(|| event.operation_class.as_str())
+    })
+}
+
+fn event_direction(event: &AttributedTokenEvent) -> &str {
+    event.direction.as_deref().unwrap_or("unknown")
+}
+
+fn token_source_label(event: &AttributedTokenEvent) -> &'static str {
+    let adapter = event.adapter.as_str();
+    let direction = event.direction.as_deref().unwrap_or("unknown");
+
+    if adapter.contains("estimated") {
+        match direction {
+            "request" => "proxy estimate request",
+            "response" => "proxy estimate response",
+            _ => "proxy estimate",
+        }
+    } else if adapter.starts_with("proxy.") {
+        "proxy exact usage"
+    } else if adapter.ends_with("-hook") {
+        match direction {
+            "request" => "hook request",
+            "response" => "hook response",
+            _ => "hook",
+        }
+    } else if adapter == "codex-cli" {
+        match direction {
+            "request" => "transcript request",
+            "response" => "transcript response",
+            _ => "transcript import",
+        }
+    } else {
+        "other"
     }
 }
 
@@ -999,6 +1257,23 @@ fn passive_self_report_json() -> String {
             share: 0.25,
         },
     ];
+    let git_workflow_rows = [report_json::GitWorkflowRow {
+        action_subtype: "status",
+        direction: "response",
+        operation_class: "vc.status",
+        totals: report_json::Totals {
+            event_count: 1,
+            run_count: 1,
+            task_count: 0,
+            input_tokens: 640,
+            output_tokens: 160,
+            cache_read_tokens: 120,
+            cache_write_tokens: 40,
+            total_tokens: 960,
+            byte_count: 1_024,
+        },
+        token_share: 0.60,
+    }];
     let warnings = [FIRST_REPORT_WARNING];
 
     report_json::serialize_report_json(&report_json::ReportJson {
@@ -1006,6 +1281,12 @@ fn passive_self_report_json() -> String {
         totals,
         run_profile_totals: &run_profile_totals,
         class_shares: &class_shares,
+        token_sources: report_json::TokenSourceBreakdown::default(),
+        git_workflow: report_json::GitWorkflowBreakdown {
+            totals: git_workflow_rows[0].totals,
+            token_share: 0.60,
+            rows: &git_workflow_rows,
+        },
         completion_rates: report_json::CompletionRates {
             tasks: report_json::CompletionRate::default(),
             runs: report_json::CompletionRate {
@@ -1036,6 +1317,19 @@ fn passive_self_report_json() -> String {
 
 fn passive_self_report_markdown() -> String {
     let totals = passive_totals();
+    let git_workflow_rows = [report_markdown::GitWorkflowRow {
+        action_subtype: "status",
+        direction: "response",
+        operation_class: "vc.status",
+        event_count: 1,
+        input_tokens: 640,
+        output_tokens: 160,
+        cache_read_tokens: 120,
+        cache_write_tokens: 40,
+        total_tokens: 960,
+        byte_count: 1_024,
+        token_share: 0.60,
+    }];
     let warnings = [FIRST_REPORT_WARNING];
 
     report_markdown::serialize_report_markdown(&report_markdown::MarkdownReport {
@@ -1062,6 +1356,18 @@ fn passive_self_report_markdown() -> String {
                 },
             },
             token_distribution: None,
+            token_sources: None,
+            git_workflow: Some(report_markdown::GitWorkflowSummary {
+                event_count: 1,
+                input_tokens: 640,
+                output_tokens: 160,
+                cache_read_tokens: 120,
+                cache_write_tokens: 40,
+                total_tokens: 960,
+                byte_count: 1_024,
+                token_share: 0.60,
+                rows: &git_workflow_rows,
+            }),
         }),
         comparison: None,
         warnings: &warnings,
@@ -1189,12 +1495,55 @@ mod tests {
         assert!(json.contains("\"event_count\": 2"));
         assert!(json.contains("\"total_tokens\": 195"));
         assert!(json.contains("\"operation_class\": \"file.read\""));
+        assert!(json.contains("\"git_workflow\": {"));
+        assert!(json.contains("\"action_subtype\": \"status\""));
+        assert!(json.contains("\"total_tokens\": 60"));
+        assert!(json.contains("\"token_share\": 0.3076923076923077"));
         assert!(json.contains("\"repeat_event_count\": 1"));
         assert!(markdown.contains("# vc-tokmeter local event report"));
         assert!(markdown.contains("## Summary"));
+        assert!(markdown.contains("## Git workflow tokens"));
+        assert!(markdown.contains("| Git total tokens | Grade O | 60 |"));
+        assert!(markdown.contains("| Git token share | Grade O | 30.8% |"));
+        assert!(markdown.contains(
+            "| status | unknown | vc.status | Grade O | 1 | 60 | 50 | 10 | 0 | 0 | 128 | 30.8% |"
+        ));
         assert!(markdown.contains("**Evidence:** Grade O"));
         assert_no_savings_claim(&json);
         assert_no_savings_claim(&markdown);
+    }
+
+    #[test]
+    fn non_git_event_log_renders_empty_git_workflow_breakdown() {
+        let output_dir = temp_output_dir("non-git-log");
+        fs::create_dir_all(&output_dir).unwrap();
+        let event_log = output_dir.join("events.jsonl");
+        write_event_log(
+            &event_log,
+            &[event(
+                "run-1",
+                "task-1",
+                "baseline",
+                OperationClass::FileRead,
+                TokenCounts::new(100, 20, 0, 0),
+                512,
+                None,
+            )],
+        );
+
+        let artifacts = create_first_report_artifacts(&output_dir, Some(&event_log)).unwrap();
+
+        let json = fs::read_to_string(&artifacts.paths.report_json).unwrap();
+        let markdown = fs::read_to_string(&artifacts.paths.report_markdown).unwrap();
+        assert!(json.contains("\"git_workflow\": {"));
+        assert!(json.contains("\"token_share\": 0"));
+        assert!(json.contains("\"rows\": [\n    ]"));
+        assert!(markdown.contains("## Git workflow tokens"));
+        assert!(markdown.contains("| Git total tokens | Grade O | 0 |"));
+        assert!(markdown.contains("| Git token share | Grade O | 0.0% |"));
+        assert!(markdown.contains(
+            "| Action subtype | Direction | Operation class | Evidence | Events | Total tokens |"
+        ));
     }
 
     #[test]
@@ -1592,6 +1941,8 @@ mod tests {
             byte_count,
             content_digest: "digest-a".to_owned(),
             repeat_of: repeat_of.map(str::to_owned),
+            action_subtype: None,
+            direction: None,
         }
     }
 }

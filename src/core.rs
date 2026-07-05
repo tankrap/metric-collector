@@ -220,6 +220,8 @@ pub struct AttributedTokenEvent {
     pub byte_count: u64,
     pub content_digest: String,
     pub repeat_of: Option<String>,
+    pub action_subtype: Option<String>,
+    pub direction: Option<String>,
 }
 
 impl AttributedTokenEvent {
@@ -235,6 +237,8 @@ impl AttributedTokenEvent {
         if let Some(repeat_of) = &self.repeat_of {
             require_not_blank("repeat_of", repeat_of)?;
         }
+        validate_optional_label("action_subtype", self.action_subtype.as_deref())?;
+        validate_optional_label("direction", self.direction.as_deref())?;
 
         self.tokens.validate()?;
         let total_tokens = self.tokens.total().unwrap_or(0);
@@ -399,6 +403,8 @@ impl From<io::Error> for EventLogError {
 
 fn serialize_event(event: &AttributedTokenEvent) -> String {
     let repeat_of = event.repeat_of.as_deref().unwrap_or("");
+    let action_subtype = event.action_subtype.as_deref().unwrap_or("");
+    let direction = event.direction.as_deref().unwrap_or("");
     IntoIterator::into_iter([
         ("schema", EVENT_LOG_SCHEMA_VERSION.to_string()),
         ("timestamp_ms", event.timestamp_ms.to_string()),
@@ -422,6 +428,8 @@ fn serialize_event(event: &AttributedTokenEvent) -> String {
         ("byte_count", event.byte_count.to_string()),
         ("digest", escape_value(&event.content_digest)),
         ("repeat_of", escape_value(repeat_of)),
+        ("action_subtype", escape_value(action_subtype)),
+        ("direction", escape_value(direction)),
     ])
     .map(|(key, value)| {
         let mut field = String::with_capacity(key.len() + value.len() + 1);
@@ -534,6 +542,8 @@ fn parse_event_line(line: &str, line_number: usize) -> Result<AttributedTokenEve
         )?,
         content_digest: string_field(&fields, "digest", line_number)?,
         repeat_of,
+        action_subtype: optional_string_field(&fields, "action_subtype", line_number)?,
+        direction: optional_string_field(&fields, "direction", line_number)?,
     })
 }
 
@@ -613,6 +623,28 @@ fn require_not_blank(field: &'static str, value: &str) -> Result<(), ValidationE
     } else {
         Ok(())
     }
+}
+
+fn validate_optional_label(
+    field: &'static str,
+    value: Option<&str>,
+) -> Result<(), ValidationError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    require_not_blank(field, value)?;
+    if value.chars().all(is_label_char) {
+        Ok(())
+    } else {
+        Err(ValidationError::new(
+            field,
+            "must contain only ASCII letters, digits, '.', '_', ':', '/', or '-'",
+        ))
+    }
+}
+
+fn is_label_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '/' | '-')
 }
 
 fn escape_value(value: &str) -> String {
@@ -695,6 +727,8 @@ mod tests {
             byte_count: 4096,
             content_digest: "sha256:abcdef0123456789".to_owned(),
             repeat_of: Some("event-001".to_owned()),
+            action_subtype: Some("git.diff".to_owned()),
+            direction: Some("response".to_owned()),
         }
     }
 

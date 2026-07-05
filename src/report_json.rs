@@ -59,6 +59,34 @@ pub struct ClassShare<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TokenSourceBreakdown<'a> {
+    pub rows: &'a [TokenSourceRow<'a>],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TokenSourceRow<'a> {
+    pub source: &'a str,
+    pub totals: Totals,
+    pub token_share: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GitWorkflowBreakdown<'a> {
+    pub totals: Totals,
+    pub token_share: f64,
+    pub rows: &'a [GitWorkflowRow<'a>],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GitWorkflowRow<'a> {
+    pub action_subtype: &'a str,
+    pub direction: &'a str,
+    pub operation_class: &'a str,
+    pub totals: Totals,
+    pub token_share: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CompletionRates {
     pub tasks: CompletionRate,
     pub runs: CompletionRate,
@@ -142,6 +170,8 @@ pub struct ReportJson<'a> {
     pub totals: Totals,
     pub run_profile_totals: &'a [RunProfileTotals<'a>],
     pub class_shares: &'a [ClassShare<'a>],
+    pub token_sources: TokenSourceBreakdown<'a>,
+    pub git_workflow: GitWorkflowBreakdown<'a>,
     pub completion_rates: CompletionRates,
     pub comparison: Option<CompareSummary<'a>>,
     pub repeat_metrics: RepeatMetrics,
@@ -188,6 +218,12 @@ impl ReportJson<'_> {
         out.push_str(",\n");
 
         write_class_shares(&mut out, self.class_shares);
+        out.push_str(",\n");
+
+        write_token_sources(&mut out, &self.token_sources);
+        out.push_str(",\n");
+
+        write_git_workflow(&mut out, &self.git_workflow);
         out.push_str(",\n");
 
         write_completion_rates(&mut out, &self.completion_rates);
@@ -390,6 +426,64 @@ fn write_class_shares(out: &mut String, shares: &[ClassShare<'_>]) {
     }
     write_indent(out, 1);
     out.push(']');
+}
+
+fn write_token_sources(out: &mut String, breakdown: &TokenSourceBreakdown<'_>) {
+    write_field_name(out, 1, "token_sources");
+    out.push_str("[\n");
+    for (index, row) in breakdown.rows.iter().enumerate() {
+        write_indent(out, 2);
+        out.push_str("{\n");
+        write_str_field(out, 3, "source", row.source, true);
+        write_field_name(out, 3, "totals");
+        write_totals(out, 3, &row.totals);
+        out.push_str(",\n");
+        write_f64_field(out, 3, "token_share", row.token_share, false);
+        write_indent(out, 2);
+        out.push('}');
+        if index + 1 != breakdown.rows.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    write_indent(out, 1);
+    out.push(']');
+}
+
+fn write_git_workflow(out: &mut String, breakdown: &GitWorkflowBreakdown<'_>) {
+    write_field_name(out, 1, "git_workflow");
+    out.push_str("{\n");
+    write_field_name(out, 2, "totals");
+    write_totals(out, 2, &breakdown.totals);
+    out.push_str(",\n");
+    write_f64_field(out, 2, "token_share", breakdown.token_share, true);
+    write_git_workflow_rows(out, breakdown.rows);
+    write_indent(out, 1);
+    out.push('}');
+}
+
+fn write_git_workflow_rows(out: &mut String, rows: &[GitWorkflowRow<'_>]) {
+    write_field_name(out, 2, "rows");
+    out.push_str("[\n");
+    for (index, row) in rows.iter().enumerate() {
+        write_indent(out, 3);
+        out.push_str("{\n");
+        write_str_field(out, 4, "action_subtype", row.action_subtype, true);
+        write_str_field(out, 4, "direction", row.direction, true);
+        write_str_field(out, 4, "operation_class", row.operation_class, true);
+        write_field_name(out, 4, "totals");
+        write_totals(out, 4, &row.totals);
+        out.push_str(",\n");
+        write_f64_field(out, 4, "token_share", row.token_share, false);
+        write_indent(out, 3);
+        out.push('}');
+        if index + 1 != rows.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    write_indent(out, 2);
+    out.push_str("]\n");
 }
 
 fn write_completion_rates(out: &mut String, completion_rates: &CompletionRates) {
@@ -693,6 +787,23 @@ mod tests {
             },
         ];
         let warnings = ["missing calibration for adapter alpha"];
+        let git_workflow_rows = [GitWorkflowRow {
+            action_subtype: "diff",
+            direction: "response",
+            operation_class: "vc.diff",
+            totals: Totals {
+                event_count: 1,
+                run_count: 0,
+                task_count: 0,
+                input_tokens: 40,
+                output_tokens: 20,
+                cache_read_tokens: 10,
+                cache_write_tokens: 0,
+                total_tokens: 70,
+                byte_count: 1024,
+            },
+            token_share: 0.33,
+        }];
         let report = ReportJson {
             evidence_grade: EvidenceGrade::GradeP,
             totals: Totals {
@@ -708,6 +819,22 @@ mod tests {
             },
             run_profile_totals: &run_profile_totals,
             class_shares: &class_shares,
+            token_sources: TokenSourceBreakdown::default(),
+            git_workflow: GitWorkflowBreakdown {
+                totals: Totals {
+                    event_count: 1,
+                    run_count: 0,
+                    task_count: 0,
+                    input_tokens: 40,
+                    output_tokens: 20,
+                    cache_read_tokens: 10,
+                    cache_write_tokens: 0,
+                    total_tokens: 70,
+                    byte_count: 1024,
+                },
+                token_share: 0.33,
+                rows: &git_workflow_rows,
+            },
             completion_rates: CompletionRates {
                 tasks: CompletionRate {
                     completed: 1,
@@ -751,6 +878,8 @@ mod tests {
         assert!(json.contains("\"evidence_caption\": \"Protocol: completed Mode T task runs with controlled task/profile pairing.\""));
         assert!(json.contains("\"total_tokens\": 215"));
         assert!(json.contains("\"operation_class\": \"vc.diff\""));
+        assert!(json.contains("\"git_workflow\": {"));
+        assert!(json.contains("\"action_subtype\": \"diff\""));
         assert!(json.contains("\"missing calibration for adapter alpha\""));
     }
 
@@ -772,6 +901,8 @@ mod tests {
             totals: Totals::default(),
             run_profile_totals: &run_profile_totals,
             class_shares: &class_shares,
+            token_sources: TokenSourceBreakdown::default(),
+            git_workflow: GitWorkflowBreakdown::default(),
             completion_rates: CompletionRates::default(),
             comparison: None,
             repeat_metrics: RepeatMetrics {

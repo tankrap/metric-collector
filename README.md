@@ -61,6 +61,8 @@ cargo run --manifest-path /path/to/metric-collector/Cargo.toml -- report \
 To capture provider-reported token counts instead of hook byte/digest evidence,
 run Codex through `tokmeter proxy`; see
 [docs/distribution.md](docs/distribution.md#local-proxy-runtime).
+For the study workflow that measures passive AI-assisted git token volume, see
+[docs/study-workflow.md](docs/study-workflow.md).
 
 Passive mode is the product path. The five-minute setup test measures this
 path: install, initialize local capture, check status, and produce the first
@@ -71,6 +73,12 @@ To verify the source-checkout onboarding path from a clean temporary copy:
 
 ```sh
 scripts/timed-onboarding-smoke.sh
+```
+
+To verify the passive study report path without live Codex or network access:
+
+```sh
+scripts/study-workflow-smoke.sh
 ```
 
 `vc-tokmeter status` is the lightweight self-report command. In the current

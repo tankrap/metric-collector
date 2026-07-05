@@ -278,9 +278,28 @@ fn build_event(
         byte_count,
         content_digest,
         repeat_of: None,
+        action_subtype: git_action_subtype(payload).map(str::to_owned),
+        direction: Some(direction_for_suffix(suffix).to_owned()),
     };
     event.validate()?;
     Ok(event)
+}
+
+fn git_action_subtype(payload: &HookPayloadFields<'_>) -> Option<&'static str> {
+    let command = payload.command.or_else(|| {
+        is_bash_tool(payload.tool_name)
+            .then_some(payload.arguments)
+            .flatten()
+    })?;
+    crate::classifier::classify_git_action(command)
+}
+
+fn direction_for_suffix(suffix: &str) -> &'static str {
+    match suffix {
+        "arguments" => "request",
+        "result" => "response",
+        _ => "unknown",
+    }
 }
 
 fn classify_payload(payload: &HookPayloadFields<'_>) -> OperationClass {

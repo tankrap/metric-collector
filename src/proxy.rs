@@ -469,6 +469,13 @@ impl EstimatedProxyDirection {
             Self::Output => "proxy.ws.response.estimated",
         }
     }
+
+    const fn event_label(self) -> &'static str {
+        match self {
+            Self::Input => "request",
+            Self::Output => "response",
+        }
+    }
 }
 
 fn estimated_proxy_payload_event(
@@ -506,6 +513,8 @@ fn estimated_proxy_payload_event(
         byte_count: payload.len() as u64,
         content_digest: estimate.content_digest,
         repeat_of: None,
+        action_subtype: None,
+        direction: Some(direction.event_label().to_owned()),
     })
 }
 
@@ -974,6 +983,8 @@ fn core_events_from_proxy_events(
                     byte_count: 0,
                     content_digest: digest_bytes(b"proxy:usage"),
                     repeat_of: None,
+                    action_subtype: None,
+                    direction: None,
                 }
             })
             .into_iter()
@@ -1009,6 +1020,8 @@ fn core_events_from_proxy_events(
                 format!("proxy:{}:{}:{}", event.task_id, event.op_class, index).as_bytes(),
             ),
             repeat_of: None,
+            action_subtype: None,
+            direction: Some("response".to_owned()),
         })
         .collect()
 }

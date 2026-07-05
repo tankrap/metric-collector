@@ -57,6 +57,54 @@ pub struct ProfileSummary<'a> {
     pub byte_count: u64,
     pub completion_rates: CompletionRates,
     pub token_distribution: Option<Distribution>,
+    pub token_sources: Option<TokenSourceSummary<'a>>,
+    pub git_workflow: Option<GitWorkflowSummary<'a>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TokenSourceSummary<'a> {
+    pub rows: &'a [TokenSourceRow<'a>],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TokenSourceRow<'a> {
+    pub source: &'a str,
+    pub event_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub total_tokens: u64,
+    pub byte_count: u64,
+    pub token_share: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GitWorkflowSummary<'a> {
+    pub event_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub total_tokens: u64,
+    pub byte_count: u64,
+    pub token_share: f64,
+    pub rows: &'a [GitWorkflowRow<'a>],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GitWorkflowRow<'a> {
+    pub action_subtype: &'a str,
+    pub direction: &'a str,
+    pub operation_class: &'a str,
+    pub event_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub total_tokens: u64,
+    pub byte_count: u64,
+    pub token_share: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -242,7 +290,139 @@ fn write_profile_summary(out: &mut String, summary: &ProfileSummary<'_>, grade: 
     }
 
     out.push('\n');
+    if let Some(token_sources) = summary.token_sources {
+        write_token_sources(out, &token_sources, grade);
+    }
+    if let Some(git_workflow) = summary.git_workflow {
+        write_git_workflow(out, &git_workflow, grade);
+    }
     write_single_completion_rates(out, &summary.completion_rates);
+}
+
+fn write_token_sources(
+    out: &mut String,
+    token_sources: &TokenSourceSummary<'_>,
+    grade: EvidenceGrade,
+) {
+    out.push_str("## Token source breakdown\n\n");
+    out.push_str("| Source | Evidence | Events | Total tokens | Input | Output | Cache read | Cache write | Bytes | Share of all tokens |\n");
+    out.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    for row in token_sources.rows {
+        out.push_str("| ");
+        out.push_str(&escape_table_cell(row.source));
+        out.push_str(" | ");
+        out.push_str(grade.label());
+        out.push_str(" | ");
+        out.push_str(&format_u64(row.event_count));
+        out.push_str(" | ");
+        out.push_str(&format_u64(row.total_tokens));
+        out.push_str(" | ");
+        out.push_str(&format_u64(row.input_tokens));
+        out.push_str(" | ");
+        out.push_str(&format_u64(row.output_tokens));
+        out.push_str(" | ");
+        out.push_str(&format_u64(row.cache_read_tokens));
+        out.push_str(" | ");
+        out.push_str(&format_u64(row.cache_write_tokens));
+        out.push_str(" | ");
+        out.push_str(&format_u64(row.byte_count));
+        out.push_str(" | ");
+        out.push_str(&format_percent(row.token_share));
+        out.push_str(" |\n");
+    }
+    out.push('\n');
+}
+
+fn write_git_workflow(
+    out: &mut String,
+    git_workflow: &GitWorkflowSummary<'_>,
+    grade: EvidenceGrade,
+) {
+    out.push_str("## Git workflow tokens\n\n");
+    out.push_str("| Metric | Evidence | Value |\n");
+    out.push_str("| --- | --- | ---: |\n");
+    write_table_row(
+        out,
+        "Git total tokens",
+        grade,
+        &format_u64(git_workflow.total_tokens),
+    );
+    write_table_row(
+        out,
+        "Git token share",
+        grade,
+        &format_percent(git_workflow.token_share),
+    );
+    write_table_row(
+        out,
+        "Git events",
+        grade,
+        &format_u64(git_workflow.event_count),
+    );
+    write_table_row(
+        out,
+        "Git input tokens",
+        grade,
+        &format_u64(git_workflow.input_tokens),
+    );
+    write_table_row(
+        out,
+        "Git output tokens",
+        grade,
+        &format_u64(git_workflow.output_tokens),
+    );
+    write_table_row(
+        out,
+        "Git cache read tokens",
+        grade,
+        &format_u64(git_workflow.cache_read_tokens),
+    );
+    write_table_row(
+        out,
+        "Git cache write tokens",
+        grade,
+        &format_u64(git_workflow.cache_write_tokens),
+    );
+    write_table_row(
+        out,
+        "Git bytes",
+        grade,
+        &format_u64(git_workflow.byte_count),
+    );
+    out.push('\n');
+
+    out.push_str("| Action subtype | Direction | Operation class | Evidence | Events | Total tokens | Input | Output | Cache read | Cache write | Bytes | Share of all tokens |\n");
+    out.push_str(
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+    );
+    for row in git_workflow.rows {
+        out.push_str("| ");
+        out.push_str(&escape_table_cell(row.action_subtype));
+        out.push_str(" | ");
+        out.push_str(&escape_table_cell(row.direction));
+        out.push_str(" | ");
+        out.push_str(&escape_table_cell(row.operation_class));
+        out.push_str(" | ");
+        out.push_str(grade.label());
+        out.push_str(" | ");
+        out.push_str(&format_u64(row.event_count));
+        out.push_str(" | ");
+        out.push_str(&format_u64(row.total_tokens));
+        out.push_str(" | ");
+        out.push_str(&format_u64(row.input_tokens));
+        out.push_str(" | ");
+        out.push_str(&format_u64(row.output_tokens));
+        out.push_str(" | ");
+        out.push_str(&format_u64(row.cache_read_tokens));
+        out.push_str(" | ");
+        out.push_str(&format_u64(row.cache_write_tokens));
+        out.push_str(" | ");
+        out.push_str(&format_u64(row.byte_count));
+        out.push_str(" | ");
+        out.push_str(&format_percent(row.token_share));
+        out.push_str(" |\n");
+    }
+    out.push('\n');
 }
 
 fn write_single_completion_rates(out: &mut String, completion_rates: &CompletionRates) {
@@ -527,6 +707,19 @@ mod tests {
 
     #[test]
     fn renders_single_profile_summary_with_distribution_and_warnings() {
+        let git_rows = [GitWorkflowRow {
+            action_subtype: "status",
+            direction: "response",
+            operation_class: "vc.status",
+            event_count: 2,
+            input_tokens: 1_000,
+            output_tokens: 250,
+            cache_read_tokens: 100,
+            cache_write_tokens: 25,
+            total_tokens: 1_375,
+            byte_count: 4_200,
+            token_share: 0.1,
+        }];
         let report = MarkdownReport {
             title: "report.md",
             single_profile: Some(ProfileSummary {
@@ -558,6 +751,18 @@ mod tests {
                     median: Some(2_750.0),
                     iqr: Some(500.5),
                 }),
+                token_sources: None,
+                git_workflow: Some(GitWorkflowSummary {
+                    event_count: 2,
+                    input_tokens: 1_000,
+                    output_tokens: 250,
+                    cache_read_tokens: 100,
+                    cache_write_tokens: 25,
+                    total_tokens: 1_375,
+                    byte_count: 4_200,
+                    token_share: 0.1,
+                    rows: &git_rows,
+                }),
             }),
             warnings: &["metadata mismatch"],
             ..MarkdownReport::default()
@@ -571,6 +776,11 @@ mod tests {
         assert!(markdown.contains("| Metric | Evidence | Value |"));
         assert!(markdown.contains("| Total tokens | Grade O | 13,750 |"));
         assert!(markdown.contains("| IQR tokens | Grade O | 500.5 |"));
+        assert!(markdown.contains("## Git workflow tokens"));
+        assert!(markdown.contains("| Git token share | Grade O | 10.0% |"));
+        assert!(markdown.contains(
+            "| status | response | vc.status | Grade O | 2 | 1,375 | 1,000 | 250 | 100 | 25 | 4,200 | 10.0% |"
+        ));
         assert!(markdown.contains("| Tasks | 4 | 1 | 0 | 5 | 80.0% |"));
     }
 

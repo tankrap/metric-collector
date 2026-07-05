@@ -5,6 +5,25 @@ pub const GIT_SHOW: &str = "git_show";
 pub const GIT_BRANCH: &str = "git_branch";
 pub const GIT_PUSH: &str = "git_push";
 pub const GIT_PULL: &str = "git_pull";
+pub const GIT_ACTION_STATUS: &str = "git.status";
+pub const GIT_ACTION_DIFF: &str = "git.diff";
+pub const GIT_ACTION_LOG: &str = "git.log";
+pub const GIT_ACTION_SHOW: &str = "git.show";
+pub const GIT_ACTION_BRANCH: &str = "git.branch";
+pub const GIT_ACTION_CHECKOUT: &str = "git.checkout";
+pub const GIT_ACTION_ADD: &str = "git.add";
+pub const GIT_ACTION_COMMIT: &str = "git.commit";
+pub const GIT_ACTION_MERGE: &str = "git.merge";
+pub const GIT_ACTION_REBASE: &str = "git.rebase";
+pub const GIT_ACTION_STASH: &str = "git.stash";
+pub const GIT_ACTION_FETCH: &str = "git.fetch";
+pub const GIT_ACTION_PULL: &str = "git.pull";
+pub const GIT_ACTION_PUSH: &str = "git.push";
+pub const GIT_ACTION_REMOTE: &str = "git.remote";
+pub const GIT_ACTION_TAG: &str = "git.tag";
+pub const GIT_ACTION_RESTORE: &str = "git.restore";
+pub const GIT_ACTION_RESET: &str = "git.reset";
+pub const GIT_ACTION_OTHER: &str = "git.other";
 pub const FILE_READ: &str = "file_read";
 pub const FILE_SEARCH: &str = "file_search";
 pub const FILE_LIST: &str = "file_list";
@@ -87,6 +106,27 @@ impl Classifier {
             ..Event::default()
         })
     }
+
+    pub fn classify_git_action(&self, command_or_payload: &str) -> Option<&'static str> {
+        classify_git_action(command_or_payload)
+    }
+}
+
+pub fn classify_git_action(command_or_payload: &str) -> Option<&'static str> {
+    command_segments(command_or_payload).find_map(|segment| {
+        let tokens = shell_tokens(segment);
+        let tokens = command_tokens(&tokens);
+
+        if tokens.first().is_some_and(|token| *token == "git") {
+            let action = git_subcommand(&tokens[1..])
+                .as_deref()
+                .map(git_action_label)
+                .unwrap_or(GIT_ACTION_OTHER);
+            return Some(action);
+        }
+
+        None
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -373,7 +413,7 @@ fn git_subcommand(tokens: &[&str]) -> Option<String> {
 
     while let Some(token) = tokens.get(index) {
         match *token {
-            "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace" => index += 2,
+            "-c" | "--git-dir" | "--work-tree" | "--namespace" => index += 2,
             "--no-pager" | "--bare" => index += 1,
             token if token.starts_with('-') => index += 1,
             token => return Some(token.to_string()),
@@ -381,6 +421,30 @@ fn git_subcommand(tokens: &[&str]) -> Option<String> {
     }
 
     None
+}
+
+fn git_action_label(subcommand: &str) -> &'static str {
+    match subcommand {
+        "status" => GIT_ACTION_STATUS,
+        "diff" => GIT_ACTION_DIFF,
+        "log" => GIT_ACTION_LOG,
+        "show" => GIT_ACTION_SHOW,
+        "branch" => GIT_ACTION_BRANCH,
+        "checkout" | "switch" => GIT_ACTION_CHECKOUT,
+        "add" => GIT_ACTION_ADD,
+        "commit" => GIT_ACTION_COMMIT,
+        "merge" => GIT_ACTION_MERGE,
+        "rebase" => GIT_ACTION_REBASE,
+        "stash" => GIT_ACTION_STASH,
+        "fetch" => GIT_ACTION_FETCH,
+        "pull" => GIT_ACTION_PULL,
+        "push" => GIT_ACTION_PUSH,
+        "remote" => GIT_ACTION_REMOTE,
+        "tag" => GIT_ACTION_TAG,
+        "restore" => GIT_ACTION_RESTORE,
+        "reset" => GIT_ACTION_RESET,
+        _ => GIT_ACTION_OTHER,
+    }
 }
 
 fn command_contains_write_redirect(segment: &str) -> bool {
@@ -513,6 +577,30 @@ mod tests {
         });
         assert_eq!(actual.operation_class, OTHER);
         assert!(!actual.generated_file);
+    }
+
+    #[test]
+    fn classifies_git_action_subcategories_without_raw_command() {
+        let classifier = Classifier::default();
+
+        assert_eq!(
+            classifier.classify_git_action("git -C /tmp/worktree status --short"),
+            Some(GIT_ACTION_STATUS)
+        );
+        assert_eq!(
+            classifier.classify_git_action("git switch feature/new-flow"),
+            Some(GIT_ACTION_CHECKOUT)
+        );
+        assert_eq!(
+            classifier.classify_git_action("git checkout -b study-branch"),
+            Some(GIT_ACTION_CHECKOUT)
+        );
+        assert_eq!(
+            classifier.classify_git_action("git unexplained-subcommand --flag"),
+            Some(GIT_ACTION_OTHER)
+        );
+        assert_eq!(classifier.classify_git_action("cargo test"), None);
+        assert_eq!(classify_git_action("rg git src"), None);
     }
 
     fn fixture_corpus() -> Vec<Fixture<'static>> {

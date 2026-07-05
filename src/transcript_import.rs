@@ -46,6 +46,8 @@ impl ImportedEvent {
             byte_count: self.byte_count,
             content_digest: self.digest.clone(),
             repeat_of: None,
+            action_subtype: crate::classifier::classify_git_action(&self.tool).map(str::to_owned),
+            direction: Some("response".to_owned()),
         }
     }
 
