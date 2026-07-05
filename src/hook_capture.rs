@@ -9,6 +9,7 @@ use crate::core::{
 };
 use crate::digest::digest_bytes;
 use crate::mode::{DEFAULT_PASSIVE_PROFILE_ID, ModeState};
+use crate::token_estimator::estimate_tool_result_tokens;
 
 const CLAUDE_CODE_HOOK_ADAPTER: &str = "claude-code-hook";
 const CODEX_HOOK_ADAPTER: &str = "codex-hook";
@@ -144,25 +145,25 @@ pub fn capture_hook_payload(
     let has_argument = argument_digest.is_some();
     let has_result = result_digest.is_some();
 
-    if let Some(digest) = &argument_digest {
+    if let (Some(digest), Some(arguments)) = (&argument_digest, payload.arguments) {
         events.push(build_event(
             payload,
             operation_class,
             &tool,
             "arguments",
-            tokens_for_arguments(payload.tokens.clone(), has_result),
+            tokens_for_arguments_payload(payload.tokens.clone(), has_result, arguments),
             argument_byte_count,
             digest.clone(),
         )?);
     }
 
-    if let Some(digest) = &result_digest {
+    if let (Some(digest), Some(result)) = (&result_digest, payload.result) {
         events.push(build_event(
             payload,
             operation_class,
             &tool,
             "result",
-            tokens_for_result(payload.tokens.clone(), has_argument),
+            tokens_for_result_payload(payload.tokens.clone(), has_argument, result),
             result_byte_count,
             digest.clone(),
         )?);
@@ -523,11 +524,47 @@ fn tokens_for_arguments(tokens: TokenCounts, has_result: bool) -> TokenCounts {
     }
 }
 
+fn tokens_for_arguments_payload(
+    tokens: TokenCounts,
+    has_result: bool,
+    payload: &str,
+) -> TokenCounts {
+    let directional = tokens_for_arguments(tokens, has_result);
+    if directional.total().unwrap_or(0) > 0 {
+        directional
+    } else {
+        TokenCounts::new(
+            estimate_tool_result_tokens(payload).tokens.output_tokens,
+            0,
+            0,
+            0,
+        )
+    }
+}
+
 fn tokens_for_result(tokens: TokenCounts, has_argument: bool) -> TokenCounts {
     if has_argument {
         TokenCounts::new(0, tokens.output_tokens, 0, 0)
     } else {
         tokens
+    }
+}
+
+fn tokens_for_result_payload(
+    tokens: TokenCounts,
+    has_argument: bool,
+    payload: &str,
+) -> TokenCounts {
+    let directional = tokens_for_result(tokens, has_argument);
+    if directional.total().unwrap_or(0) > 0 {
+        directional
+    } else {
+        TokenCounts::new(
+            0,
+            estimate_tool_result_tokens(payload).tokens.output_tokens,
+            0,
+            0,
+        )
     }
 }
 
@@ -733,6 +770,50 @@ mod tests {
         assert!(serialized.contains("tool=Bash.result"));
         assert!(!serialized.contains("git status"));
         assert!(!serialized.contains("SECRET_RAW_SOURCE_MARKER"));
+    }
+
+    #[test]
+    fn codex_git_hooks_without_usage_fields_get_estimated_tokens() {
+        let payload = concat!(
+            "{",
+            "\"hook_event_name\":\"PostToolUse\",",
+            "\"tool_name\":\"Bash\",",
+            "\"tool_input\":{\"command\":\"git status --short\"},",
+            "\"tool_response\":{\"stdout\":\"M src/main.rs\\n?? docs/live-testing.md\"}",
+            "}"
+        );
+        let request =
+            HookRuntimeRequest::new("/tmp/tokmeter-events.jsonl", payload, 9, "run-codex")
+                .with_source("codex");
+        let parsed = ParsedHookRuntimePayload::parse(&request.stdin_payload);
+        let metadata = HookCaptureMetadata::passive(request.timestamp_ms, &request.run_id)
+            .with_adapter(hook_adapter_for_source(&request.source));
+        let fields = HookPayloadFields {
+            metadata,
+            tool_name: parsed.tool_name.as_deref().unwrap_or(UNKNOWN_TOOL),
+            command: parsed.command.as_deref(),
+            arguments: parsed.arguments.as_deref(),
+            result: parsed.result.as_deref(),
+            tokens: parsed.tokens,
+        };
+
+        let captured = capture_hook_payload(&fields).expect("hook payload captures");
+
+        assert_eq!(captured.events.len(), 2);
+        assert_eq!(captured.events[0].operation_class, OperationClass::VcStatus);
+        assert_eq!(
+            captured.events[0].action_subtype.as_deref(),
+            Some("git.status")
+        );
+        assert!(captured.events[0].tokens.input_tokens > 0);
+        assert_eq!(captured.events[0].tokens.output_tokens, 0);
+        assert_eq!(captured.events[1].operation_class, OperationClass::VcStatus);
+        assert_eq!(
+            captured.events[1].action_subtype.as_deref(),
+            Some("git.status")
+        );
+        assert_eq!(captured.events[1].tokens.input_tokens, 0);
+        assert!(captured.events[1].tokens.output_tokens > 0);
     }
 
     #[test]
