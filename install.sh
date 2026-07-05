@@ -271,20 +271,31 @@ resolve_symlink_target() {
   esac
 }
 
+read_shim_default_real_bin() {
+  file="$1"
+  [ -f "$file" ] || return 1
+  sed -n "s/^default_real_bin='\(.*\)'$/\1/p" "$file" | sed -n '1p'
+}
+
 install_agent_shim() {
   name="$1"
   subcommand="$2"
   bin_flag="$3"
   env_var="$4"
+  explicit_default_real_bin="${5:-}"
   shim="$bin_dir/$name"
-  default_real_bin=""
+  default_real_bin="$explicit_default_real_bin"
 
   if [ -e "$shim" ] && [ "$force_agent_aliases" -ne 1 ] && ! is_tokmeter_agent_shim "$shim"; then
     log "skipped $shim (already exists; rerun with --force-agent-aliases to replace)"
     return 0
   fi
 
-  if [ -e "$shim" ] && ! is_tokmeter_agent_shim "$shim"; then
+  if [ -z "$default_real_bin" ] && [ -e "$shim" ] && is_tokmeter_agent_shim "$shim"; then
+    default_real_bin="$(read_shim_default_real_bin "$shim" || true)"
+  fi
+
+  if [ -z "$default_real_bin" ] && [ -e "$shim" ] && ! is_tokmeter_agent_shim "$shim"; then
     default_real_bin="$(resolve_symlink_target "$shim" || true)"
   fi
 
@@ -325,6 +336,17 @@ if [ -z "\$real_bin" ]; then
   fi
 fi
 
+if [ "\$shim_name" = "codex" ] && { [ -n "\${CODEX_THREAD_ID:-}" ] || [ -n "\${CODEX_SANDBOX:-}" ]; }; then
+  if [ -z "\$real_bin" ]; then
+    real_bin="\$(find_real_agent)" || {
+      printf 'error: cannot find downstream %s command outside %s\\n' "\$shim_name" "\$shim_dir" >&2
+      printf 'Set $env_var to the real %s binary path.\\n' "\$shim_name" >&2
+      exit 127
+    }
+  fi
+  exec "\$real_bin" "\$@"
+fi
+
 if [ -z "\$real_bin" ]; then
   real_bin="\$(find_real_agent)" || {
     printf 'error: cannot find downstream %s command outside %s\\n' "\$shim_name" "\$shim_dir" >&2
@@ -341,8 +363,8 @@ EOF
 }
 
 if [ "$install_agent_aliases" -eq 1 ]; then
-  install_agent_shim codex codex-tui --codex-bin TOKMETER_CODEX_BIN
-  install_agent_shim claude claude-code --claude-bin TOKMETER_CLAUDE_BIN
+  install_agent_shim codex codex-tui --codex-bin TOKMETER_CODEX_BIN "${TOKMETER_CODEX_BIN:-}"
+  install_agent_shim claude claude-code --claude-bin TOKMETER_CLAUDE_BIN "${TOKMETER_CLAUDE_BIN:-}"
 fi
 
 case ":$PATH:" in
