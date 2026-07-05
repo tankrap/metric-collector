@@ -109,6 +109,16 @@ To verify the passive study report path without live Codex or network access:
 scripts/study-workflow-smoke.sh
 ```
 
+To run real Codex, Claude Code, and Claude Desktop test paths with less command
+memorization, use the live matrix helper:
+
+```sh
+scripts/live-agent-matrix.sh doctor --repo /path/to/repository
+```
+
+See [docs/live-testing.md](docs/live-testing.md) for exact API-backed paths,
+subscription paths, and desktop MCP setup.
+
 `vc-tokmeter status` is the lightweight self-report command. In the current
 early CLI it prints:
 
