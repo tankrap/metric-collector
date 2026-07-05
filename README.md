@@ -33,6 +33,9 @@ still v1 distribution targets.
 For a one-page external tester flow with install, study prompts, report,
 optional upload, and uninstall, see
 [docs/tester-quickstart.md](docs/tester-quickstart.md).
+For a surface-by-surface explanation of Codex CLI, Claude Code CLI, and Claude
+Desktop GUI collection paths, see
+[docs/install-and-app-flows.md](docs/install-and-app-flows.md).
 
 Passive-first source-checkout flow:
 

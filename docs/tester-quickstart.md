@@ -22,6 +22,9 @@ The default install also creates `codex` and `claude` command shims in the same
 directory. When that directory is first on `PATH`, normal `codex` or `claude`
 sessions run through tokmeter collection automatically.
 
+For a fuller explanation of CLI shims versus GUI/MCP setup, see
+[`install-and-app-flows.md`](install-and-app-flows.md).
+
 ## Pick a repository
 
 Use a local repository where you are comfortable running an AI assistant. The
