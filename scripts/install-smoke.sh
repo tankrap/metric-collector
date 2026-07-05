@@ -44,6 +44,8 @@ TOKMETER_OS=linux TOKMETER_ARCH=amd64 \
 
 grep -q "dry_run=true" "$log_dir/dry-run.log"
 grep -q "would_install=$prefix/bin/vc-tokmeter" "$log_dir/dry-run.log"
+grep -q "would_install=$prefix/bin/codex" "$log_dir/dry-run.log"
+grep -q "would_install=$prefix/bin/claude" "$log_dir/dry-run.log"
 
 TOKMETER_OS=linux TOKMETER_ARCH=amd64 \
   "$repo_root/install.sh" \
@@ -51,11 +53,56 @@ TOKMETER_OS=linux TOKMETER_ARCH=amd64 \
   --prefix "$prefix" >"$log_dir/install.log"
 
 test -x "$prefix/bin/vc-tokmeter"
+test -x "$prefix/bin/codex"
+test -x "$prefix/bin/claude"
 "$prefix/bin/vc-tokmeter" --help | grep -q "fake vc-tokmeter --help"
+TOKMETER_CODEX_BIN=/usr/local/bin/codex-real "$prefix/bin/codex" --version \
+  | grep -q "fake vc-tokmeter codex-tui --codex-bin /usr/local/bin/codex-real -- --version"
+TOKMETER_CLAUDE_BIN=/usr/local/bin/claude-real "$prefix/bin/claude" --version \
+  | grep -q "fake vc-tokmeter claude-code --claude-bin /usr/local/bin/claude-real -- --version"
 grep -q "checksum verified" "$log_dir/install.log"
 grep -q "export PATH=\"$prefix/bin:" "$log_dir/install.log"
 grep -q "did not edit your shell profiles" "$log_dir/install.log"
+grep -q "installed $prefix/bin/codex" "$log_dir/install.log"
+grep -q "installed $prefix/bin/claude" "$log_dir/install.log"
 tar -tzf "$release_dir/$artifact" | grep -q "^vc-tokmeter$"
+
+foreign_prefix="$work_root/install-foreign"
+mkdir -p "$foreign_prefix/bin"
+cat >"$foreign_prefix/bin/codex" <<'EOF'
+#!/bin/sh
+printf 'foreign codex\n'
+EOF
+chmod +x "$foreign_prefix/bin/codex"
+
+TOKMETER_OS=linux TOKMETER_ARCH=amd64 \
+  "$repo_root/install.sh" \
+  --base-url "$release_dir" \
+  --prefix "$foreign_prefix" >"$log_dir/foreign-install.log"
+
+"$foreign_prefix/bin/codex" | grep -q "foreign codex"
+grep -q "skipped $foreign_prefix/bin/codex" "$log_dir/foreign-install.log"
+test -x "$foreign_prefix/bin/claude"
+
+force_prefix="$work_root/install-force"
+real_agent_dir="$work_root/real-agents"
+mkdir -p "$force_prefix/bin" "$real_agent_dir"
+cat >"$real_agent_dir/codex" <<'EOF'
+#!/bin/sh
+printf 'real codex\n'
+EOF
+chmod +x "$real_agent_dir/codex"
+ln -s "$real_agent_dir/codex" "$force_prefix/bin/codex"
+
+TOKMETER_OS=linux TOKMETER_ARCH=amd64 \
+  "$repo_root/install.sh" \
+  --base-url "$release_dir" \
+  --prefix "$force_prefix" \
+  --force-agent-aliases >"$log_dir/force-install.log"
+
+"$force_prefix/bin/codex" --version \
+  | grep -q "fake vc-tokmeter codex-tui --codex-bin $real_agent_dir/codex -- --version"
+grep -q "installed $force_prefix/bin/codex" "$log_dir/force-install.log"
 
 printf '0000000000000000000000000000000000000000000000000000000000000000  %s\n' \
   "$artifact" >"$release_dir/SHA256SUMS"

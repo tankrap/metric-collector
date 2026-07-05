@@ -18,6 +18,10 @@ export PATH="$HOME/.local/bin:$PATH"
 vc-tokmeter --help
 ```
 
+The default install also creates `codex` and `claude` command shims in the same
+directory. When that directory is first on `PATH`, normal `codex` or `claude`
+sessions run through tokmeter collection automatically.
+
 ## Pick a repository
 
 Use a local repository where you are comfortable running an AI assistant. The
@@ -54,14 +58,18 @@ vc-tokmeter live-test codex-exec --repo "$PWD" \
 Codex interactive TUI:
 
 ```sh
-vc-tokmeter codex-tui
+codex
 ```
 
 Claude Code:
 
 ```sh
-vc-tokmeter claude-code
+claude
 ```
+
+The explicit forms, `vc-tokmeter codex-tui` and `vc-tokmeter claude-code`, are
+also supported. Each wrapped session uses its own free localhost proxy port, so
+multiple Codex or Claude sessions can run at the same time.
 
 Claude Desktop:
 

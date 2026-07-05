@@ -548,10 +548,7 @@ fn command_codex_tui(args: &[String]) -> Result<(), String> {
     let (session_args, codex_args) = split_passthrough_args(args);
     let provider = codex_provider(session_args)?;
     let bind_host = value_after(session_args, "--bind-host").unwrap_or("127.0.0.1");
-    let bind_port = value_after(session_args, "--port")
-        .unwrap_or("17683")
-        .parse::<u16>()
-        .map_err(|error| format!("invalid --port: {error}"))?;
+    let bind_port = proxy_wrapper_bind_port(session_args)?;
     let upstream = value_after(session_args, "--upstream").unwrap_or_else(|| provider.upstream());
     let event_log = value_after(session_args, "--event-log")
         .map(PathBuf::from)
@@ -567,11 +564,15 @@ fn command_codex_tui(args: &[String]) -> Result<(), String> {
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
 
-    let config = ProxyConfig::new(bind_host, bind_port, upstream)
+    let mut config = ProxyConfig::new(bind_host, bind_port, upstream)
         .map_err(|error| error.to_string())?
         .with_event_log_path(event_log.clone());
     let listener = TcpListener::bind((config.bind_host.as_str(), config.bind_port))
         .map_err(|error| format!("cannot bind proxy: {error}"))?;
+    config.bind_port = listener
+        .local_addr()
+        .map_err(|error| format!("cannot read proxy listener address: {error}"))?
+        .port();
     let base_override = provider.base_override(&config.bind_host, config.bind_port);
     let proxy_config = config.clone();
 
@@ -634,10 +635,7 @@ fn command_codex_tui(args: &[String]) -> Result<(), String> {
 fn command_claude_code(args: &[String]) -> Result<(), String> {
     let (session_args, claude_args) = split_passthrough_args(args);
     let bind_host = value_after(session_args, "--bind-host").unwrap_or("127.0.0.1");
-    let bind_port = value_after(session_args, "--port")
-        .unwrap_or("17684")
-        .parse::<u16>()
-        .map_err(|error| format!("invalid --port: {error}"))?;
+    let bind_port = proxy_wrapper_bind_port(session_args)?;
     let upstream = value_after(session_args, "--upstream").unwrap_or("https://api.anthropic.com");
     let event_log = value_after(session_args, "--event-log")
         .map(PathBuf::from)
@@ -653,12 +651,16 @@ fn command_claude_code(args: &[String]) -> Result<(), String> {
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
 
-    let config = ProxyConfig::new(bind_host, bind_port, upstream)
+    let mut config = ProxyConfig::new(bind_host, bind_port, upstream)
         .map_err(|error| error.to_string())?
         .with_event_log_path(event_log.clone())
         .with_adapter_label("proxy.claude.anthropic");
     let listener = TcpListener::bind((config.bind_host.as_str(), config.bind_port))
         .map_err(|error| format!("cannot bind proxy: {error}"))?;
+    config.bind_port = listener
+        .local_addr()
+        .map_err(|error| format!("cannot read proxy listener address: {error}"))?
+        .port();
     let anthropic_base_url = claude_anthropic_base_url(&config.bind_host, config.bind_port);
     let proxy_config = config.clone();
 
@@ -945,6 +947,13 @@ fn split_passthrough_args(args: &[String]) -> (&[String], &[String]) {
     }
 }
 
+fn proxy_wrapper_bind_port(args: &[String]) -> Result<u16, String> {
+    value_after(args, "--port")
+        .unwrap_or("0")
+        .parse::<u16>()
+        .map_err(|error| format!("invalid --port: {error}"))
+}
+
 fn claude_anthropic_base_url(bind_host: &str, bind_port: u16) -> String {
     format!("http://{bind_host}:{bind_port}")
 }
@@ -1220,6 +1229,15 @@ mod tests {
         assert_eq!(provider.upstream(), "https://api.openai.com");
         assert_eq!(base.key, "openai_base_url");
         assert_eq!(base.value, "http://localhost:48123/v1");
+    }
+
+    #[test]
+    fn proxy_wrappers_default_to_os_assigned_ports() {
+        assert_eq!(proxy_wrapper_bind_port(&args(&[])).unwrap(), 0);
+        assert_eq!(
+            proxy_wrapper_bind_port(&args(&["--port", "17683"])).unwrap(),
+            17683
+        );
     }
 
     #[test]

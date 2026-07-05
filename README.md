@@ -26,8 +26,10 @@ cargo run -- --help
 
 Install options are documented in [docs/distribution.md](docs/distribution.md).
 External testers can use the release installer, then run `vc-tokmeter setup`
-from the repository they want to measure. `npx` and `pipx` wrappers are still
-v1 distribution targets.
+from the repository they want to measure. The release installer also creates
+`codex` and `claude` shims by default so ordinary agent launches are collected
+when the install directory is first on `PATH`. `npx` and `pipx` wrappers are
+still v1 distribution targets.
 For a one-page external tester flow with install, study prompts, report,
 optional upload, and uninstall, see
 [docs/tester-quickstart.md](docs/tester-quickstart.md).
@@ -80,7 +82,8 @@ For Claude Desktop and other MCP-capable desktop apps, see
 For exact, estimated, and mixed token fidelity across Codex, Claude, desktop
 apps, and imports, see [docs/adapter-fidelity.md](docs/adapter-fidelity.md).
 For long interactive Codex TUI sessions, use the wrapper so collection runs for
-the full session:
+the full session. The wrapper auto-selects a free localhost proxy port by
+default, so multiple wrapped sessions can run at the same time:
 
 ```sh
 cargo run --manifest-path /path/to/metric-collector/Cargo.toml -- codex-tui

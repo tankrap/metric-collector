@@ -12,7 +12,8 @@ cargo run --manifest-path /Users/justin/metrics/Cargo.toml -- claude-code
 The wrapper starts a localhost-only proxy, sets `ANTHROPIC_BASE_URL` for the
 launched `claude` process, appends proxy events to `.tokmeter/events.jsonl`, and
 writes `.tokmeter/report` after Claude exits. It does not set or persist
-provider credentials.
+provider credentials. By default each wrapper run asks the OS for a free
+localhost port, so multiple wrapped Claude sessions can run concurrently.
 
 While Claude Code is still running, generate an interim report from another
 terminal:
@@ -40,8 +41,8 @@ cargo run --manifest-path /Users/justin/metrics/Cargo.toml -- claude-code \
   --keep-anthropic-api-key
 ```
 
-Use a custom Claude binary, port, upstream, event log, or report directory when
-needed:
+Use a custom Claude binary, fixed port, upstream, event log, or report
+directory when needed:
 
 ```sh
 cargo run --manifest-path /Users/justin/metrics/Cargo.toml -- claude-code \

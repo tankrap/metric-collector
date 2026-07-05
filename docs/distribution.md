@@ -30,9 +30,11 @@ curl -fsSL https://raw.githubusercontent.com/tankrap/metric-collector/main/insta
   --prefix /usr/local
 ```
 
-The installer verifies the tarball checksum before copying `vc-tokmeter`. It
-prints PATH guidance when the install directory is not already on `PATH` and
-does not edit shell profiles.
+The installer verifies the tarball checksum before copying `vc-tokmeter`. By
+default it also installs `codex` and `claude` shims in the same directory so
+normal agent commands run through tokmeter collection. It prints PATH guidance
+when the install directory is not already on `PATH` and does not edit shell
+profiles.
 
 ## Hosted Bash Installer
 
@@ -54,10 +56,20 @@ curl -fsSL https://raw.githubusercontent.com/tankrap/metric-collector/main/insta
 
 # Install from a local or self-hosted artifact directory for smoke tests.
 ./install.sh --base-url ./dist --prefix /tmp/vc-tokmeter-install
+
+# Install only vc-tokmeter, without codex/claude command shims.
+./install.sh --no-agent-aliases
 ```
 
 The release workflow uploads stable platform artifact names and a combined
 `SHA256SUMS`, which keeps the hosted installer URL stable across releases.
+
+The `codex` and `claude` shims are ordinary executable scripts. They search
+`PATH` for the real downstream agent outside the tokmeter install directory and
+then run `vc-tokmeter codex-tui --codex-bin <real-codex>` or
+`vc-tokmeter claude-code --claude-bin <real-claude>`. Existing foreign files
+named `codex` or `claude` in the install directory are not replaced unless the
+installer is run with `--force-agent-aliases`.
 
 ## Current Source Checkout
 
@@ -162,10 +174,11 @@ managed for the whole interactive session:
 cargo run --manifest-path /Users/justin/metrics/Cargo.toml -- claude-code
 ```
 
-The wrapper starts the localhost proxy on port `17684`, sets
+The wrapper starts the localhost proxy on an OS-assigned free port, sets
 `ANTHROPIC_BASE_URL` for the launched `claude` process, removes
 `ANTHROPIC_API_KEY` by default so subscription login is not accidentally
-overridden, and writes a report after Claude exits. Use
+overridden, and writes a report after Claude exits. This allows multiple
+tokmeter-wrapped Claude sessions to run at the same time. Use
 `--keep-anthropic-api-key` for intentional API-key testing.
 
 Pass Claude Code arguments after `--`:

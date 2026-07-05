@@ -8,6 +8,8 @@ bin_dir="${TOKMETER_BIN_DIR:-}"
 base_url="${TOKMETER_DOWNLOAD_BASE:-}"
 dry_run=0
 binary_name="vc-tokmeter"
+install_agent_aliases="${TOKMETER_INSTALL_AGENT_ALIASES:-1}"
+force_agent_aliases="${TOKMETER_FORCE_AGENT_ALIASES:-0}"
 
 usage() {
   cat <<'EOF'
@@ -21,13 +23,18 @@ Options:
   --version VERSION  GitHub release tag to install (default: latest)
   --repo OWNER/REPO  GitHub repository (default: tankrap/metric-collector)
   --base-url URL     Release artifact base URL or local directory
+  --agent-aliases    Install codex and claude shims into the install dir (default)
+  --no-agent-aliases Skip codex and claude shim installation
+  --force-agent-aliases
+                     Replace existing tokmeter-managed or foreign shims
   --dry-run          Print planned install details without downloading
   -h, --help         Show this help
 
 Environment:
   TOKMETER_PREFIX, TOKMETER_BIN_DIR, TOKMETER_VERSION, TOKMETER_REPO,
-  TOKMETER_DOWNLOAD_BASE, TOKMETER_OS, and TOKMETER_ARCH mirror the options
-  above. TOKMETER_OS and TOKMETER_ARCH are intended for installer tests.
+  TOKMETER_DOWNLOAD_BASE, TOKMETER_INSTALL_AGENT_ALIASES,
+  TOKMETER_FORCE_AGENT_ALIASES, TOKMETER_OS, and TOKMETER_ARCH mirror the
+  options above. TOKMETER_OS and TOKMETER_ARCH are intended for installer tests.
 EOF
 }
 
@@ -70,6 +77,18 @@ while [ "$#" -gt 0 ]; do
       need_arg "$@"
       base_url="$2"
       shift 2
+      ;;
+    --agent-aliases)
+      install_agent_aliases=1
+      shift
+      ;;
+    --no-agent-aliases)
+      install_agent_aliases=0
+      shift
+      ;;
+    --force-agent-aliases)
+      force_agent_aliases=1
+      shift
       ;;
     --dry-run)
       dry_run=1
@@ -129,12 +148,17 @@ log "version=$version"
 log "platform=$os/$arch"
 log "artifact=$artifact"
 log "install_dir=$bin_dir"
+log "agent_aliases=$install_agent_aliases"
 
 if [ "$dry_run" -eq 1 ]; then
   log "dry_run=true"
   log "would_download=$archive_url"
   log "would_verify=$checksums_url"
   log "would_install=$bin_dir/$binary_name"
+  if [ "$install_agent_aliases" -eq 1 ]; then
+    log "would_install=$bin_dir/codex"
+    log "would_install=$bin_dir/claude"
+  fi
   exit 0
 fi
 
@@ -219,6 +243,108 @@ mv "$tmp_install" "$bin_dir/$binary_name"
 
 log "installed $bin_dir/$binary_name"
 
+is_tokmeter_agent_shim() {
+  file="$1"
+  [ -f "$file" ] || return 1
+  grep -q "created_by=vc-tokmeter-agent-shim" "$file" 2>/dev/null
+}
+
+sh_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+resolve_symlink_target() {
+  link="$1"
+  [ -L "$link" ] || return 1
+  target="$(readlink "$link")" || return 1
+  case "$target" in
+    /*)
+      printf '%s\n' "$target"
+      ;;
+    *)
+      link_dir="$(dirname -- "$link")"
+      target_dir="$(dirname -- "$target")"
+      target_base="$(basename -- "$target")"
+      resolved_dir="$(CDPATH= cd -- "$link_dir/$target_dir" 2>/dev/null && pwd -P)" || return 1
+      printf '%s/%s\n' "$resolved_dir" "$target_base"
+      ;;
+  esac
+}
+
+install_agent_shim() {
+  name="$1"
+  subcommand="$2"
+  bin_flag="$3"
+  env_var="$4"
+  shim="$bin_dir/$name"
+  default_real_bin=""
+
+  if [ -e "$shim" ] && [ "$force_agent_aliases" -ne 1 ] && ! is_tokmeter_agent_shim "$shim"; then
+    log "skipped $shim (already exists; rerun with --force-agent-aliases to replace)"
+    return 0
+  fi
+
+  if [ -e "$shim" ] && ! is_tokmeter_agent_shim "$shim"; then
+    default_real_bin="$(resolve_symlink_target "$shim" || true)"
+  fi
+
+  tmp_shim="$bin_dir/.$name.tmp.$$"
+  quoted_default_real_bin="$(sh_quote "$default_real_bin")"
+  cat >"$tmp_shim" <<EOF
+#!/bin/sh
+# created_by=vc-tokmeter-agent-shim
+set -eu
+
+shim_name="$name"
+shim_dir="\$(CDPATH= cd -- "\$(dirname -- "\$0")" && pwd -P)"
+tokmeter="\$shim_dir/$binary_name"
+real_bin="\${$env_var:-}"
+default_real_bin=$quoted_default_real_bin
+
+find_real_agent() {
+  old_ifs="\$IFS"
+  IFS=:
+  for dir in \$PATH; do
+    [ -n "\$dir" ] || dir=.
+    abs_dir="\$(CDPATH= cd -- "\$dir" 2>/dev/null && pwd -P)" || continue
+    [ "\$abs_dir" = "\$shim_dir" ] && continue
+    candidate="\$abs_dir/\$shim_name"
+    if [ -x "\$candidate" ]; then
+      IFS="\$old_ifs"
+      printf '%s\\n' "\$candidate"
+      return 0
+    fi
+  done
+  IFS="\$old_ifs"
+  return 1
+}
+
+if [ -z "\$real_bin" ]; then
+  if [ -n "\$default_real_bin" ] && [ -x "\$default_real_bin" ]; then
+    real_bin="\$default_real_bin"
+  fi
+fi
+
+if [ -z "\$real_bin" ]; then
+  real_bin="\$(find_real_agent)" || {
+    printf 'error: cannot find downstream %s command outside %s\\n' "\$shim_name" "\$shim_dir" >&2
+    printf 'Set $env_var to the real %s binary path.\\n' "\$shim_name" >&2
+    exit 127
+  }
+fi
+
+exec "\$tokmeter" $subcommand $bin_flag "\$real_bin" -- "\$@"
+EOF
+  chmod 755 "$tmp_shim"
+  mv "$tmp_shim" "$shim"
+  log "installed $shim"
+}
+
+if [ "$install_agent_aliases" -eq 1 ]; then
+  install_agent_shim codex codex-tui --codex-bin TOKMETER_CODEX_BIN
+  install_agent_shim claude claude-code --claude-bin TOKMETER_CLAUDE_BIN
+fi
+
 case ":$PATH:" in
   *:"$bin_dir":*)
     log "$bin_dir is already on PATH"
@@ -234,3 +360,7 @@ esac
 
 log "Try it:"
 log "  vc-tokmeter --help"
+if [ "$install_agent_aliases" -eq 1 ]; then
+  log "  codex --help"
+  log "  claude --help"
+fi
