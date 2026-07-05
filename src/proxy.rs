@@ -19,6 +19,7 @@ use crate::proxy_privacy::{
     redact_provider_credentials, redact_provider_error, redact_sensitive_headers,
 };
 use crate::proxy_usage::{ProviderUsage, extract_provider_usage};
+use crate::token_estimator::estimate_tool_result_tokens;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyConfig {
@@ -175,8 +176,17 @@ pub fn process_proxy_exchange_with_mode(
     let usage = extract_provider_usage(provider_response_json);
     let redacted_response = redact_provider_error(provider_response_json);
     let events = attribute_proxy_json_with_mode(&request.body, &redacted_response, mode_state);
-    let core_events =
+    let mut core_events =
         core_events_from_proxy_events(&events, usage, current_timestamp_ms(), "proxy");
+    if core_events.is_empty() {
+        core_events.extend(estimated_proxy_payload_event(
+            provider_response_json,
+            "proxy.estimated",
+            "proxy.response.estimated",
+            EstimatedProxyDirection::Output,
+            current_timestamp_ms(),
+        ));
+    }
     let event_log_records = render_core_event_log_records(&core_events)?;
     let persisted_log_line =
         render_persisted_log_line(&request.method, &path, &redacted_headers, usage, &events);
@@ -331,7 +341,7 @@ fn serve_websocket_proxy_connection(
     local_ws
         .get_mut()
         .set_read_timeout(Some(Duration::from_millis(150)))?;
-    forward_initial_websocket_client_messages(&mut local_ws, &mut upstream_ws)?;
+    forward_initial_websocket_client_messages(&mut local_ws, &mut upstream_ws, config)?;
     relay_upstream_websocket_messages(&mut upstream_ws, &mut local_ws, config)
 }
 
@@ -360,6 +370,7 @@ fn append_proxy_event_log_records(path: &PathBuf, records: &[u8]) -> io::Result<
 fn forward_initial_websocket_client_messages<S>(
     local_ws: &mut tungstenite::WebSocket<TcpStream>,
     upstream_ws: &mut tungstenite::WebSocket<S>,
+    config: &ProxyConfig,
 ) -> io::Result<()>
 where
     S: Read + Write,
@@ -368,6 +379,7 @@ where
         match local_ws.read() {
             Ok(message) => {
                 let should_stop = matches!(message, Message::Close(_));
+                capture_websocket_message(&message, config, EstimatedProxyDirection::Input)?;
                 upstream_ws.send(message).map_err(websocket_io_error)?;
                 if should_stop {
                     return Ok(());
@@ -401,7 +413,7 @@ where
             Err(error) => return Err(websocket_io_error(error)),
         };
 
-        capture_websocket_message_usage(&message, config)?;
+        capture_websocket_message(&message, config, EstimatedProxyDirection::Output)?;
         let should_stop = matches!(message, Message::Close(_));
         local_ws.send(message).map_err(websocket_io_error)?;
 
@@ -411,7 +423,11 @@ where
     }
 }
 
-fn capture_websocket_message_usage(message: &Message, config: &ProxyConfig) -> io::Result<()> {
+fn capture_websocket_message(
+    message: &Message,
+    config: &ProxyConfig,
+    direction: EstimatedProxyDirection,
+) -> io::Result<()> {
     let Some(event_log_path) = &config.event_log_path else {
         return Ok(());
     };
@@ -419,14 +435,78 @@ fn capture_websocket_message_usage(message: &Message, config: &ProxyConfig) -> i
         return Ok(());
     };
     let usage = extract_provider_usage(text);
-    if !usage.has_any_usage() {
+    let events = if usage.has_any_usage() {
+        core_events_from_proxy_events(&[], usage, current_timestamp_ms(), "proxy.ws")
+    } else {
+        estimated_proxy_payload_event(
+            text,
+            "proxy.ws.estimated",
+            direction.websocket_tool_name(),
+            direction,
+            current_timestamp_ms(),
+        )
+        .into_iter()
+        .collect()
+    };
+    if events.is_empty() {
         return Ok(());
     }
-
-    let events = core_events_from_proxy_events(&[], usage, current_timestamp_ms(), "proxy.ws");
     let records = render_core_event_log_records(&events)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
     append_proxy_event_log_records(event_log_path, &records)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EstimatedProxyDirection {
+    Input,
+    Output,
+}
+
+impl EstimatedProxyDirection {
+    const fn websocket_tool_name(self) -> &'static str {
+        match self {
+            Self::Input => "proxy.ws.request.estimated",
+            Self::Output => "proxy.ws.response.estimated",
+        }
+    }
+}
+
+fn estimated_proxy_payload_event(
+    payload: &str,
+    adapter: &str,
+    tool: &str,
+    direction: EstimatedProxyDirection,
+    timestamp_ms: u64,
+) -> Option<AttributedTokenEvent> {
+    if payload.trim().is_empty() {
+        return None;
+    }
+
+    let estimate = estimate_tool_result_tokens(payload);
+    let estimated_tokens = estimate.tokens.output_tokens;
+    if estimated_tokens == 0 {
+        return None;
+    }
+    let mode = ModeState::passive();
+    let tokens = match direction {
+        EstimatedProxyDirection::Input => TokenCounts::new(estimated_tokens, 0, 0, 0),
+        EstimatedProxyDirection::Output => TokenCounts::new(0, estimated_tokens, 0, 0),
+    };
+
+    Some(AttributedTokenEvent {
+        timestamp_ms,
+        mode: mode.mode,
+        run_id: "proxy-passive".to_owned(),
+        task_id: mode.task_id,
+        profile_id: mode.profile_id,
+        adapter: adapter.to_owned(),
+        operation_class: OperationClass::Other,
+        tool: tool.to_owned(),
+        tokens,
+        byte_count: payload.len() as u64,
+        content_digest: estimate.content_digest,
+        repeat_of: None,
+    })
 }
 
 fn websocket_message_text(message: &Message) -> Option<&str> {
@@ -1485,7 +1565,7 @@ mod tests {
                 .into(),
         );
 
-        capture_websocket_message_usage(&message, &config).unwrap();
+        capture_websocket_message(&message, &config, EstimatedProxyDirection::Output).unwrap();
 
         let persisted = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -1494,6 +1574,48 @@ mod tests {
         assert!(persisted.contains("input_tokens=31"));
         assert!(persisted.contains("output_tokens=7"));
         assert!(!persisted.contains("PRIVATE_CONTENT_FIXTURE"));
+    }
+
+    #[test]
+    fn websocket_missing_usage_emits_estimated_proxy_event_without_content() {
+        let path = std::env::temp_dir().join(format!(
+            "tokmeter-ws-estimated-{}-{}.jsonl",
+            std::process::id(),
+            current_timestamp_ms()
+        ));
+        let config = ProxyConfig::new("127.0.0.1", 17683, "https://chatgpt.com/backend-api")
+            .unwrap()
+            .with_event_log_path(&path);
+        let message = Message::Text(
+            r#"{"type":"delta","message":{"content":"PRIVATE_SUBSCRIPTION_CONTENT_FIXTURE with enough text to estimate tokens"}}"#
+                .into(),
+        );
+
+        capture_websocket_message(&message, &config, EstimatedProxyDirection::Output).unwrap();
+
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(persisted.contains("adapter=proxy.ws.estimated"));
+        assert!(persisted.contains("tool=proxy.ws.response.estimated"));
+        assert!(persisted.contains("output_tokens="));
+        assert!(!persisted.contains("output_tokens=0"));
+        assert!(!persisted.contains("PRIVATE_SUBSCRIPTION_CONTENT_FIXTURE"));
+    }
+
+    #[test]
+    fn http_missing_usage_emits_estimated_proxy_event_without_content() {
+        let request = concat!("POST /backend-api/conversation HTTP/1.1\r\n", "\r\n", "{}");
+        let response = r#"{"message":{"content":"PRIVATE_HTTP_CONTENT_FIXTURE with enough text to estimate tokens"}}"#;
+
+        let capture = process_proxy_exchange(request, response).unwrap();
+        let persisted = String::from_utf8(capture.event_log_records).unwrap();
+
+        assert_eq!(capture.core_events.len(), 1);
+        assert_eq!(capture.core_events[0].adapter, "proxy.estimated");
+        assert!(capture.core_events[0].tokens.output_tokens > 0);
+        assert!(persisted.contains("adapter=proxy.estimated"));
+        assert!(!persisted.contains("PRIVATE_HTTP_CONTENT_FIXTURE"));
     }
 
     #[test]
