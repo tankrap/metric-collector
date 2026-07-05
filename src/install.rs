@@ -41,6 +41,10 @@ impl InitRequest {
         self.tokmeter_dir().join("hooks")
     }
 
+    fn codex_dir(&self) -> PathBuf {
+        self.install_root.join(".codex")
+    }
+
     fn runs_dir(&self) -> PathBuf {
         self.tokmeter_dir().join("runs")
     }
@@ -51,6 +55,10 @@ impl InitRequest {
 
     fn hook_path(&self) -> PathBuf {
         self.hooks_dir().join("claude-code-hook.json")
+    }
+
+    fn codex_hook_path(&self) -> PathBuf {
+        self.codex_dir().join("hooks.json")
     }
 }
 
@@ -242,6 +250,13 @@ pub fn plan_init(
                 detail: "local run metadata",
             },
             InstalledItemRecord {
+                path: request.codex_dir(),
+                kind: InstallItemKind::Directory,
+                action: InstallAction::CreateDirectory,
+                created_by_tokmeter: true,
+                detail: "Codex project configuration",
+            },
+            InstalledItemRecord {
                 path: request.manifest_path(),
                 kind: InstallItemKind::File,
                 action: InstallAction::CreateFile,
@@ -254,6 +269,13 @@ pub fn plan_init(
                 action: InstallAction::CreateFile,
                 created_by_tokmeter: true,
                 detail: "agent hook wiring",
+            },
+            InstalledItemRecord {
+                path: request.codex_hook_path(),
+                kind: InstallItemKind::File,
+                action: InstallAction::CreateFile,
+                created_by_tokmeter: true,
+                detail: "Codex project hook wiring",
             },
             InstalledItemRecord {
                 path: request.agent_config_path.clone(),
@@ -616,6 +638,8 @@ mod tests {
         assert!(uninstall.is_residue_free_for_tokmeter_items());
 
         for expected_path in [
+            request.codex_hook_path(),
+            request.codex_dir(),
             request.hook_path(),
             request.hooks_dir(),
             request.manifest_path(),
@@ -649,7 +673,7 @@ mod tests {
         let partial_records = vec![
             plan.records[0].clone(),
             plan.records[1].clone(),
-            plan.records[5].clone(),
+            plan.records[7].clone(),
         ];
         let config = agent_config_after_init(Some("existing = true\n"), &request);
         let cleanup = plan_failed_init_cleanup(&partial_records, Some(&config));

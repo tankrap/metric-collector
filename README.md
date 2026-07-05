@@ -39,6 +39,25 @@ cargo run -- doctor
 cargo run -- uninstall
 ```
 
+For Codex CLI testing, run `init` from the repository you want to measure. From
+a source checkout, use this form from the target repository:
+
+```sh
+cargo run --manifest-path /path/to/metric-collector/Cargo.toml -- init
+```
+
+It writes a project-local `.codex/hooks.json` with `PreToolUse` and
+`PostToolUse` command hooks that append privacy-safe events to
+`.tokmeter/events.jsonl`. Start Codex in that trusted project, open `/hooks`,
+trust the new tokmeter hooks if prompted, then use Codex normally. Generate a
+local report with:
+
+```sh
+cargo run --manifest-path /path/to/metric-collector/Cargo.toml -- report \
+  --event-log .tokmeter/events.jsonl \
+  --out .tokmeter/report
+```
+
 Passive mode is the product path. The five-minute setup test measures this
 path: install, initialize local capture, check status, and produce the first
 local report. Current source-checkout reports use Grade O self-report fixture

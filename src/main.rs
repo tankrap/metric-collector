@@ -227,6 +227,7 @@ fn command_hook(args: &[String]) -> Result<(), String> {
     let event_log = value_after(args, "--event-log")
         .map(PathBuf::from)
         .unwrap_or(default_event_log_path()?);
+    let source = value_after(args, "--source").unwrap_or("claude-code");
     let mut stdin_payload = String::new();
     io::stdin()
         .read_to_string(&mut stdin_payload)
@@ -236,7 +237,8 @@ fn command_hook(args: &[String]) -> Result<(), String> {
         stdin_payload,
         unix_time_ms(),
         format!("hook-{}", unix_time_ms()),
-    );
+    )
+    .with_source(source);
     let executed = execute_hook_runtime(&request)
         .map_err(|error| format!("cannot execute hook payload: {error}"))?;
     println!(
@@ -290,7 +292,35 @@ fn apply_init_plan(plan: &InitPlan, request: &InitRequest) -> Result<(), String>
                         if record.path.file_name().and_then(|name| name.to_str())
                             == Some("claude-code-hook.json") =>
                     {
-                        hook_file_content(&default_event_log_path()?)
+                        claude_hook_file_content(&default_event_log_path()?)
+                    }
+                    InstallAction::CreateFile
+                        if record.path.file_name().and_then(|name| name.to_str())
+                            == Some("hooks.json")
+                            && record
+                                .path
+                                .parent()
+                                .and_then(|path| path.file_name())
+                                .and_then(|name| name.to_str())
+                                == Some(".codex") =>
+                    {
+                        if record.path.exists() {
+                            let existing = fs::read_to_string(&record.path).map_err(|error| {
+                                format!(
+                                    "cannot inspect existing Codex hooks {}: {error}",
+                                    record.path.display()
+                                )
+                            })?;
+                            if !existing.contains("vc-tokmeter hook --source codex") {
+                                return Err(format!(
+                                    "{} already exists; move it aside or merge tokmeter hooks manually before running init",
+                                    record.path.display()
+                                ));
+                            }
+                            existing
+                        } else {
+                            codex_hook_file_content(&default_event_log_path()?)
+                        }
                     }
                     InstallAction::CreateFile => {
                         format!("created_by=vc-tokmeter\ndetail={}\n", record.detail)
@@ -367,14 +397,105 @@ fn default_completed_runs_path() -> Result<PathBuf, String> {
     ))
 }
 
-fn hook_file_content(event_log_path: &std::path::Path) -> String {
-    format!(
-        "{{\n  \"hooks\": [\n    {{\n      \"event\": \"PreToolUse\",\n      \"command\": \"vc-tokmeter hook --source claude-code --event PreToolUse --event-log {}\"\n    }},\n    {{\n      \"event\": \"PostToolUse\",\n      \"command\": \"vc-tokmeter hook --source claude-code --event PostToolUse --event-log {}\"\n    }}\n  ]\n}}\n",
-        event_log_path.display(),
+fn claude_hook_file_content(event_log_path: &std::path::Path) -> String {
+    let command = shell_quote(&tokmeter_binary_command());
+    let pre_command = json_string(&format!(
+        "{command} hook --source claude-code --event PreToolUse --event-log {}",
         event_log_path.display()
+    ));
+    let post_command = json_string(&format!(
+        "{command} hook --source claude-code --event PostToolUse --event-log {}",
+        event_log_path.display()
+    ));
+
+    format!(
+        "{{\n  \"hooks\": [\n    {{\n      \"event\": \"PreToolUse\",\n      \"command\": {}\n    }},\n    {{\n      \"event\": \"PostToolUse\",\n      \"command\": {}\n    }}\n  ]\n}}\n",
+        pre_command, post_command
     )
 }
 
+fn codex_hook_file_content(event_log_path: &std::path::Path) -> String {
+    let command = shell_quote(&tokmeter_binary_command());
+    let pre_command = json_string(&format!(
+        "{command} hook --source codex --event PreToolUse --event-log {}",
+        event_log_path.display()
+    ));
+    let post_command = json_string(&format!(
+        "{command} hook --source codex --event PostToolUse --event-log {}",
+        event_log_path.display()
+    ));
+
+    format!(
+        concat!(
+            "{{\n",
+            "  \"hooks\": {{\n",
+            "    \"PreToolUse\": [\n",
+            "      {{\n",
+            "        \"matcher\": \"*\",\n",
+            "        \"hooks\": [\n",
+            "          {{\n",
+            "            \"type\": \"command\",\n",
+            "            \"command\": {},\n",
+            "            \"timeout\": 30,\n",
+            "            \"statusMessage\": \"Recording tokmeter tool input\"\n",
+            "          }}\n",
+            "        ]\n",
+            "      }}\n",
+            "    ],\n",
+            "    \"PostToolUse\": [\n",
+            "      {{\n",
+            "        \"matcher\": \"*\",\n",
+            "        \"hooks\": [\n",
+            "          {{\n",
+            "            \"type\": \"command\",\n",
+            "            \"command\": {},\n",
+            "            \"timeout\": 30,\n",
+            "            \"statusMessage\": \"Recording tokmeter tool output\"\n",
+            "          }}\n",
+            "        ]\n",
+            "      }}\n",
+            "    ]\n",
+            "  }}\n",
+            "}}\n"
+        ),
+        pre_command, post_command
+    )
+}
+
+fn tokmeter_binary_command() -> String {
+    env::current_exe()
+        .ok()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "vc-tokmeter".to_owned())
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
 fn value_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.windows(2)
         .find(|window| window[0] == flag)

@@ -10,7 +10,8 @@ use crate::core::{
 use crate::digest::digest_bytes;
 use crate::mode::{DEFAULT_PASSIVE_PROFILE_ID, ModeState};
 
-const DEFAULT_ADAPTER: &str = "claude-code-hook";
+const CLAUDE_CODE_HOOK_ADAPTER: &str = "claude-code-hook";
+const CODEX_HOOK_ADAPTER: &str = "codex-hook";
 const UNKNOWN_TOOL: &str = "unknown-tool";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +32,7 @@ impl<'a> HookCaptureMetadata<'a> {
             run_id,
             task_id,
             profile_id,
-            adapter: DEFAULT_ADAPTER,
+            adapter: CLAUDE_CODE_HOOK_ADAPTER,
         }
     }
 
@@ -42,7 +43,7 @@ impl<'a> HookCaptureMetadata<'a> {
             run_id,
             task_id: crate::core::ADHOC_TASK_ID,
             profile_id: DEFAULT_PASSIVE_PROFILE_ID,
-            adapter: DEFAULT_ADAPTER,
+            adapter: CLAUDE_CODE_HOOK_ADAPTER,
         }
     }
 
@@ -53,12 +54,17 @@ impl<'a> HookCaptureMetadata<'a> {
             run_id,
             task_id: &state.task_id,
             profile_id: &state.profile_id,
-            adapter: DEFAULT_ADAPTER,
+            adapter: CLAUDE_CODE_HOOK_ADAPTER,
         }
     }
 
     pub const fn with_mode(mut self, mode: CaptureMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    pub const fn with_adapter(mut self, adapter: &'a str) -> Self {
+        self.adapter = adapter;
         self
     }
 }
@@ -94,6 +100,7 @@ pub struct HookRuntimeRequest {
     pub stdin_payload: String,
     pub timestamp_ms: u64,
     pub run_id: String,
+    pub source: String,
 }
 
 impl HookRuntimeRequest {
@@ -108,7 +115,13 @@ impl HookRuntimeRequest {
             stdin_payload: stdin_payload.into(),
             timestamp_ms,
             run_id: run_id.into(),
+            source: "claude-code".to_owned(),
         }
+    }
+
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = source.into();
+        self
     }
 }
 
@@ -194,7 +207,9 @@ pub fn execute_hook_payload(
 
 pub fn execute_hook_runtime(request: &HookRuntimeRequest) -> io::Result<ExecutedHookPayload> {
     let parsed = ParsedHookRuntimePayload::parse(&request.stdin_payload);
-    let metadata = HookCaptureMetadata::passive(request.timestamp_ms, &request.run_id);
+    let adapter = hook_adapter_for_source(&request.source);
+    let metadata =
+        HookCaptureMetadata::passive(request.timestamp_ms, &request.run_id).with_adapter(adapter);
     let fields = HookPayloadFields {
         metadata,
         tool_name: parsed.tool_name.as_deref().unwrap_or(UNKNOWN_TOOL),
@@ -232,6 +247,13 @@ pub fn hook_field_digest(field_name: &str, value: &str) -> String {
     bytes.push(0);
     bytes.extend_from_slice(value.as_bytes());
     digest_bytes(&bytes)
+}
+
+pub fn hook_adapter_for_source(source: &str) -> &'static str {
+    match source.trim().to_ascii_lowercase().as_str() {
+        "codex" | "codex-cli" => CODEX_HOOK_ADAPTER,
+        _ => CLAUDE_CODE_HOOK_ADAPTER,
+    }
 }
 
 fn build_event(
@@ -544,6 +566,34 @@ mod tests {
         assert!(serialized.contains("op_class=other"));
         assert!(serialized.contains("tool=Bash.arguments"));
         assert!(serialized.contains("tool=Bash.result"));
+    }
+
+    #[test]
+    fn runtime_request_uses_codex_adapter_when_source_is_codex() {
+        let request = HookRuntimeRequest::new(
+            "/tmp/tokmeter-events.jsonl",
+            "{\"tool_name\":\"Bash\",\"arguments\":\"git status\",\"input_tokens\":4}",
+            7,
+            "run-codex",
+        )
+        .with_source("codex");
+        let parsed = ParsedHookRuntimePayload::parse(&request.stdin_payload);
+        let metadata = HookCaptureMetadata::passive(request.timestamp_ms, &request.run_id)
+            .with_adapter(hook_adapter_for_source(&request.source));
+        let fields = HookPayloadFields {
+            metadata,
+            tool_name: parsed.tool_name.as_deref().unwrap_or(UNKNOWN_TOOL),
+            command: parsed.command.as_deref(),
+            arguments: parsed.arguments.as_deref(),
+            result: parsed.result.as_deref(),
+            tokens: parsed.tokens,
+        };
+
+        let executed = execute_hook_payload(&fields).expect("hook payload executes");
+        let serialized = String::from_utf8(executed.event_log_records).expect("event log is utf8");
+
+        assert!(serialized.contains("adapter=codex-hook"));
+        assert!(serialized.contains("tool=Bash.arguments"));
     }
 
     #[test]

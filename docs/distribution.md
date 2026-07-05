@@ -21,7 +21,33 @@ Prerequisites:
 
 - Rust stable toolchain with Cargo.
 - A local repository where the tester can run baseline and treatment tasks.
-- Claude Code hooks or local proxy wiring once the matching adapter is enabled.
+- Codex hooks, Claude Code hooks, or local proxy wiring once the matching
+  adapter is enabled.
+
+## Codex Project Hook
+
+From the repository you want to measure, run the source-checkout binary's
+`init` command. During development that usually means invoking this checkout
+with Cargo from the target repository:
+
+```sh
+cargo run --manifest-path /path/to/metric-collector/Cargo.toml -- init
+```
+
+`init` creates a project-local `.codex/hooks.json` containing Codex
+`PreToolUse` and `PostToolUse` command hooks. The hook command points back to
+the running `vc-tokmeter` binary and appends privacy-safe event records to
+`.tokmeter/events.jsonl`.
+
+Start Codex in that trusted project, run `/hooks`, and trust the tokmeter hook
+definitions if Codex marks them for review. Then use Codex normally and produce
+a local report:
+
+```sh
+cargo run --manifest-path /path/to/metric-collector/Cargo.toml -- report \
+  --event-log .tokmeter/events.jsonl \
+  --out .tokmeter/report
+```
 
 ## Local Proxy Runtime Primitive
 
