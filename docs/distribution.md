@@ -55,21 +55,23 @@ The proxy runtime is intentionally localhost-only. `ProxyConfig::new` accepts
 `localhost`, `127.0.0.1`, or `::1` bind hosts and rejects wildcard or LAN
 addresses before binding.
 
-The runtime supports HTTP and HTTPS upstream forwarding. It rewrites the
-request target to the configured upstream base path, forwards provider
-credentials to the upstream, relays the upstream response bytes to the client,
-and captures only sanitized metadata locally:
+The runtime supports HTTP, HTTPS, and Codex WebSocket upstream forwarding. It
+rewrites the request target to the configured upstream base path, forwards
+provider credentials to the upstream, relays the upstream response bytes or
+WebSocket frames to the client, and captures only sanitized metadata locally:
 
 - request method and query-redacted path;
 - sensitive headers with values replaced by `[REDACTED]`;
-- provider usage/cache token fields from the upstream response body;
+- provider usage/cache token fields from the upstream response body or
+  WebSocket response frames;
 - attribution-compatible proxy events and core event-log JSONL records.
 
 Prompt bodies, response content, tool output text, query credential values, and
 provider credentials are not persisted in proxy capture records. By default,
 `tokmeter proxy` appends captured core event records to `.tokmeter/events.jsonl`.
 
-To test Codex through the proxy against OpenAI:
+To test Codex through the proxy against OpenAI with your normal Codex
+subscription login:
 
 ```sh
 cargo run --manifest-path /Users/justin/metrics/Cargo.toml -- proxy \
@@ -84,6 +86,11 @@ Then start Codex in a separate terminal with a user-level base URL override:
 ```sh
 codex -c openai_base_url='"http://127.0.0.1:17683/v1"'
 ```
+
+Do not set a separate Platform API key for this subscription test. Codex will
+send its normal cached Codex/ChatGPT credential through the local proxy. The
+proxy upgrades local `ws://127.0.0.1:17683/v1/responses` requests to upstream
+`wss://api.openai.com/v1/responses`.
 
 Run a short Codex task, stop the proxy, and regenerate the report:
 

@@ -3,7 +3,11 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use tungstenite::client::IntoClientRequest;
+use tungstenite::{Message, accept, connect};
 
 use crate::core::{AttributedTokenEvent, EventLog, EventLogError, OperationClass, TokenCounts};
 use crate::digest::digest_bytes;
@@ -267,6 +271,10 @@ pub fn forward_proxy_request_with_mode(
 
 fn serve_proxy_connection(mut stream: TcpStream, config: &ProxyConfig) -> io::Result<()> {
     let request = read_http_like_request(&mut stream)?;
+    if is_websocket_upgrade_request(&request) {
+        return serve_websocket_proxy_connection(stream, config, &request);
+    }
+
     match forward_proxy_request(config, &request) {
         Ok(exchange) => {
             if let Some(event_log_path) = &config.event_log_path {
@@ -281,6 +289,41 @@ fn serve_proxy_connection(mut stream: TcpStream, config: &ProxyConfig) -> io::Re
     }
 }
 
+fn serve_websocket_proxy_connection(
+    stream: TcpStream,
+    config: &ProxyConfig,
+    raw_request: &str,
+) -> io::Result<()> {
+    let request = parse_http_request(raw_request)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let upstream = ParsedUpstream::parse(&config.upstream_url)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let upstream_url = upstream.websocket_url_for_request_path(&request.path);
+    let mut upstream_request = upstream_url
+        .into_client_request()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+
+    copy_websocket_forward_headers(&request.headers, upstream_request.headers_mut())?;
+
+    let mut local_ws = accept(stream).map_err(handshake_io_error)?;
+    local_ws
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_millis(150)))?;
+    let (mut upstream_ws, _) = connect(upstream_request).map_err(websocket_io_error)?;
+    forward_initial_websocket_client_messages(&mut local_ws, &mut upstream_ws)?;
+    relay_upstream_websocket_messages(&mut upstream_ws, &mut local_ws, config)
+}
+
+fn is_websocket_upgrade_request(raw_request: &str) -> bool {
+    parse_http_request(raw_request)
+        .map(|request| {
+            request.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("upgrade") && value.eq_ignore_ascii_case("websocket")
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn append_proxy_event_log_records(path: &PathBuf, records: &[u8]) -> io::Result<()> {
     if records.is_empty() {
         return Ok(());
@@ -291,6 +334,123 @@ fn append_proxy_event_log_records(path: &PathBuf, records: &[u8]) -> io::Result<
     }
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(records)
+}
+
+fn forward_initial_websocket_client_messages<S>(
+    local_ws: &mut tungstenite::WebSocket<TcpStream>,
+    upstream_ws: &mut tungstenite::WebSocket<S>,
+) -> io::Result<()>
+where
+    S: Read + Write,
+{
+    loop {
+        match local_ws.read() {
+            Ok(message) => {
+                let should_stop = matches!(message, Message::Close(_));
+                upstream_ws.send(message).map_err(websocket_io_error)?;
+                if should_stop {
+                    return Ok(());
+                }
+            }
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(websocket_io_error(error)),
+        }
+    }
+}
+
+fn relay_upstream_websocket_messages<S>(
+    upstream_ws: &mut tungstenite::WebSocket<S>,
+    local_ws: &mut tungstenite::WebSocket<TcpStream>,
+    config: &ProxyConfig,
+) -> io::Result<()>
+where
+    S: Read + Write,
+{
+    loop {
+        let message = match upstream_ws.read() {
+            Ok(message) => message,
+            Err(tungstenite::Error::ConnectionClosed) => return Ok(()),
+            Err(error) => return Err(websocket_io_error(error)),
+        };
+
+        capture_websocket_message_usage(&message, config)?;
+        let should_stop = matches!(message, Message::Close(_));
+        local_ws.send(message).map_err(websocket_io_error)?;
+
+        if should_stop {
+            return Ok(());
+        }
+    }
+}
+
+fn capture_websocket_message_usage(message: &Message, config: &ProxyConfig) -> io::Result<()> {
+    let Some(event_log_path) = &config.event_log_path else {
+        return Ok(());
+    };
+    let Some(text) = websocket_message_text(message) else {
+        return Ok(());
+    };
+    let usage = extract_provider_usage(text);
+    if !usage.has_any_usage() {
+        return Ok(());
+    }
+
+    let events = core_events_from_proxy_events(&[], usage, current_timestamp_ms(), "proxy.ws");
+    let records = render_core_event_log_records(&events)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    append_proxy_event_log_records(event_log_path, &records)
+}
+
+fn websocket_message_text(message: &Message) -> Option<&str> {
+    match message {
+        Message::Text(text) => Some(text.as_ref()),
+        _ => None,
+    }
+}
+
+fn copy_websocket_forward_headers(
+    headers: &[(String, String)],
+    upstream_headers: &mut tungstenite::http::HeaderMap,
+) -> io::Result<()> {
+    for (name, value) in headers {
+        if is_hop_by_hop_websocket_header(name) {
+            continue;
+        }
+        let Ok(header_name) = tungstenite::http::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(header_value) = tungstenite::http::HeaderValue::from_str(value) else {
+            continue;
+        };
+        upstream_headers.insert(header_name, header_value);
+    }
+
+    Ok(())
+}
+
+fn is_hop_by_hop_websocket_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("host")
+        || name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("upgrade")
+        || name.eq_ignore_ascii_case("sec-websocket-key")
+        || name.eq_ignore_ascii_case("sec-websocket-version")
+        || name.eq_ignore_ascii_case("sec-websocket-extensions")
+        || name.eq_ignore_ascii_case("sec-websocket-protocol")
+}
+
+fn websocket_io_error(error: tungstenite::Error) -> io::Error {
+    io::Error::other(redact_provider_error(&error.to_string()))
+}
+
+fn handshake_io_error(error: impl fmt::Display) -> io::Error {
+    io::Error::other(redact_provider_error(&error.to_string()))
 }
 
 fn read_http_like_request(stream: &mut impl Read) -> io::Result<String> {
@@ -401,6 +561,16 @@ impl ParsedUpstream {
         format!(
             "{}://{}{}",
             self.scheme,
+            self.host_header,
+            self.target_for_request_path(request_path)
+        )
+    }
+
+    fn websocket_url_for_request_path(&self, request_path: &str) -> String {
+        let scheme = if self.scheme == "https" { "wss" } else { "ws" };
+        format!(
+            "{}://{}{}",
+            scheme,
             self.host_header,
             self.target_for_request_path(request_path)
         )
@@ -1223,6 +1393,56 @@ mod tests {
             upstream.target_url_for_request_path("/v1/responses?stream=true"),
             "https://api.openai.com/v1/responses?stream=true"
         );
+    }
+
+    #[test]
+    fn websocket_upgrade_requests_are_detected_case_insensitively() {
+        let request = concat!(
+            "GET /v1/responses HTTP/1.1\r\n",
+            "Host: 127.0.0.1:17683\r\n",
+            "Connection: Upgrade\r\n",
+            "Upgrade: websocket\r\n",
+            "Sec-WebSocket-Key: fixture\r\n",
+            "\r\n"
+        );
+
+        assert!(is_websocket_upgrade_request(request));
+    }
+
+    #[test]
+    fn websocket_upstream_url_uses_wss_for_https_upstream() {
+        let upstream = ParsedUpstream::parse("https://api.openai.com/v1").unwrap();
+
+        assert_eq!(
+            upstream.websocket_url_for_request_path("/v1/responses"),
+            "wss://api.openai.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn websocket_usage_capture_emits_proxy_ws_event_without_content() {
+        let path = std::env::temp_dir().join(format!(
+            "tokmeter-ws-{}-{}.jsonl",
+            std::process::id(),
+            current_timestamp_ms()
+        ));
+        let config = ProxyConfig::new("127.0.0.1", 17683, "https://api.openai.com")
+            .unwrap()
+            .with_event_log_path(&path);
+        let message = Message::Text(
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":31,"output_tokens":7},"output_text":"PRIVATE_CONTENT_FIXTURE"}}"#
+                .into(),
+        );
+
+        capture_websocket_message_usage(&message, &config).unwrap();
+
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(persisted.contains("adapter=proxy.ws"));
+        assert!(persisted.contains("input_tokens=31"));
+        assert!(persisted.contains("output_tokens=7"));
+        assert!(!persisted.contains("PRIVATE_CONTENT_FIXTURE"));
     }
 
     #[test]
