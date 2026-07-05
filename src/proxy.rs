@@ -464,11 +464,18 @@ fn join_paths(base_path: &str, request_path: &str) -> String {
         .split_once('?')
         .map(|(path, query)| (path, Some(query)))
         .unwrap_or((request_path, None));
-    let joined = format!(
-        "{}/{}",
-        base_path.trim_end_matches('/'),
-        path.trim_start_matches('/')
-    );
+    let base = base_path.trim_end_matches('/');
+    let request = path.trim_start_matches('/');
+    let base_last_segment = base.rsplit('/').next().unwrap_or_default();
+    let request_without_duplicate = request
+        .strip_prefix(base_last_segment)
+        .and_then(|suffix| suffix.strip_prefix('/'))
+        .unwrap_or(request);
+    let joined = if request_without_duplicate.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{base}/{request_without_duplicate}")
+    };
 
     query
         .map(|query| format!("{joined}?{query}"))
@@ -1201,6 +1208,20 @@ mod tests {
         assert_eq!(
             upstream.target_url_for_request_path("/responses"),
             "https://api.openai.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn upstream_path_join_avoids_duplicate_api_version_segment() {
+        let upstream = ParsedUpstream::parse("https://api.openai.com/v1").unwrap();
+
+        assert_eq!(
+            upstream.target_url_for_request_path("/v1/responses"),
+            "https://api.openai.com/v1/responses"
+        );
+        assert_eq!(
+            upstream.target_url_for_request_path("/v1/responses?stream=true"),
+            "https://api.openai.com/v1/responses?stream=true"
         );
     }
 

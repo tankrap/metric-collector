@@ -75,7 +75,7 @@ To test Codex through the proxy against OpenAI:
 cargo run --manifest-path /Users/justin/metrics/Cargo.toml -- proxy \
   --bind-host 127.0.0.1 \
   --port 17683 \
-  --upstream https://api.openai.com/v1 \
+  --upstream https://api.openai.com \
   --event-log .tokmeter/events.jsonl
 ```
 
