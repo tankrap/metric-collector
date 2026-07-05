@@ -334,8 +334,10 @@ impl ParsedHookRuntimePayload {
         Self {
             tool_name: extract_json_string_any(payload, &["tool_name", "tool", "name"]),
             command: extract_json_string_any(payload, &["command"]),
-            arguments: extract_json_string_any(payload, &["arguments", "input", "params"]),
-            result: extract_json_string_any(payload, &["result", "content", "tool_output"]),
+            arguments: extract_json_string_any(payload, &["arguments", "input", "params"])
+                .or_else(|| extract_json_value_any(payload, &["tool_input"])),
+            result: extract_json_string_any(payload, &["result", "content", "tool_output"])
+                .or_else(|| extract_json_value_any(payload, &["tool_output", "tool_response"])),
             tokens: TokenCounts::new(
                 extract_json_u64_any(payload, &["input_tokens", "prompt_tokens"]).unwrap_or(0),
                 extract_json_u64_any(payload, &["output_tokens", "completion_tokens"]).unwrap_or(0),
@@ -344,6 +346,88 @@ impl ParsedHookRuntimePayload {
             ),
         }
     }
+}
+
+fn extract_json_value_any(payload: &str, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| extract_json_value(payload, key))
+}
+
+fn extract_json_value(payload: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{key}\"");
+    let start = payload.find(&pattern)?;
+    let after_key = &payload[start + pattern.len()..];
+    let colon = after_key.find(':')?;
+    let value = after_key[colon + 1..].trim_start();
+    let end = json_value_end(value)?;
+
+    Some(value[..end].trim().to_owned())
+}
+
+fn json_value_end(value: &str) -> Option<usize> {
+    let first = value.chars().next()?;
+    match first {
+        '"' => json_string_end(value),
+        '{' | '[' => json_container_end(value),
+        _ => Some(
+            value
+                .char_indices()
+                .find_map(|(index, ch)| {
+                    matches!(ch, ',' | '\n' | '\r' | '}' | ']').then_some(index)
+                })
+                .unwrap_or(value.len()),
+        ),
+    }
+}
+
+fn json_string_end(value: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (index, ch) in value.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Some(index + ch.len_utf8());
+        }
+    }
+
+    None
+}
+
+fn json_container_end(value: &str) -> Option<usize> {
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (index, ch) in value.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if stack.pop() != Some(ch) {
+                    return None;
+                }
+                if stack.is_empty() {
+                    return Some(index + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn extract_json_string_any(payload: &str, keys: &[&str]) -> Option<String> {
@@ -594,6 +678,42 @@ mod tests {
 
         assert!(serialized.contains("adapter=codex-hook"));
         assert!(serialized.contains("tool=Bash.arguments"));
+    }
+
+    #[test]
+    fn codex_object_payloads_capture_tool_input_and_response_without_raw_content() {
+        let payload = concat!(
+            "{",
+            "\"hook_event_name\":\"PostToolUse\",",
+            "\"tool_name\":\"Bash\",",
+            "\"tool_input\":{\"command\":\"git status --short\"},",
+            "\"tool_response\":{\"stdout\":\"M SECRET_RAW_SOURCE_MARKER\"}",
+            "}"
+        );
+        let request =
+            HookRuntimeRequest::new("/tmp/tokmeter-events.jsonl", payload, 8, "run-codex")
+                .with_source("codex");
+        let parsed = ParsedHookRuntimePayload::parse(&request.stdin_payload);
+        let metadata = HookCaptureMetadata::passive(request.timestamp_ms, &request.run_id)
+            .with_adapter(hook_adapter_for_source(&request.source));
+        let fields = HookPayloadFields {
+            metadata,
+            tool_name: parsed.tool_name.as_deref().unwrap_or(UNKNOWN_TOOL),
+            command: parsed.command.as_deref(),
+            arguments: parsed.arguments.as_deref(),
+            result: parsed.result.as_deref(),
+            tokens: parsed.tokens,
+        };
+
+        let executed = execute_hook_payload(&fields).expect("hook payload executes");
+        let serialized = String::from_utf8(executed.event_log_records).expect("event log is utf8");
+
+        assert!(serialized.contains("adapter=codex-hook"));
+        assert!(serialized.contains("op_class=vc.status"));
+        assert!(serialized.contains("tool=Bash.arguments"));
+        assert!(serialized.contains("tool=Bash.result"));
+        assert!(!serialized.contains("git status"));
+        assert!(!serialized.contains("SECRET_RAW_SOURCE_MARKER"));
     }
 
     #[test]
