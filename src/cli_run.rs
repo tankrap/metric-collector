@@ -1,6 +1,10 @@
 use std::error::Error;
 use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
+use crate::completion::{CompletionRecord, CompletionStatus};
 use crate::mode::ModeState;
 use crate::run::{Profile as RunProfile, RunMetadata};
 use crate::scheduler::{
@@ -9,6 +13,9 @@ use crate::scheduler::{
 use crate::tasks::{Task, TaskManifest};
 
 const DEFAULT_RUN_ADAPTER: &str = "tokmeter";
+pub const COMPLETED_RUNS_FILE_NAME: &str = "completed-runs.tsv";
+const COMPLETED_RUNS_HEADER: &str = "vc-tokmeter completed-runs v1";
+const COMPLETED_RUNS_FIELD_COUNT: usize = 9;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RunCliArgs {
@@ -44,6 +51,105 @@ impl CompletedRun {
             profile_id: profile_id.into(),
             repetition,
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompletedRunRecord {
+    pub run_id: String,
+    pub task_id: String,
+    pub profile_id: String,
+    pub repetition: usize,
+    pub status: CompletionStatus,
+    pub adapter: String,
+    pub started_at_ms: u64,
+    pub ended_at_ms: Option<u64>,
+    pub completed_at_unix: u64,
+}
+
+impl CompletedRunRecord {
+    pub fn new(
+        run_id: impl Into<String>,
+        task_id: impl Into<String>,
+        profile_id: impl Into<String>,
+        repetition: usize,
+        status: CompletionStatus,
+        adapter: impl Into<String>,
+        started_at_ms: u64,
+        ended_at_ms: Option<u64>,
+        completed_at_unix: u64,
+    ) -> Result<Self, CompletedRunStoreError> {
+        let record = Self {
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            profile_id: profile_id.into(),
+            repetition,
+            status,
+            adapter: adapter.into(),
+            started_at_ms,
+            ended_at_ms,
+            completed_at_unix,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn validate(&self) -> Result<(), CompletedRunStoreError> {
+        validate_completed_run_field("run_id", &self.run_id)?;
+        crate::run::validate_task_id(&self.task_id).map_err(|error| {
+            CompletedRunStoreError::Validation {
+                field: error.field,
+                message: error.message,
+            }
+        })?;
+        comparison_profile(&self.profile_id).map_err(|error| match error {
+            RunPlanError::InvalidProfile { profile_id } => CompletedRunStoreError::Validation {
+                field: "profile_id",
+                message: format!("invalid comparison profile `{profile_id}`"),
+            },
+            _ => CompletedRunStoreError::Validation {
+                field: "profile_id",
+                message: error.to_string(),
+            },
+        })?;
+        if self.repetition == 0 {
+            return Err(CompletedRunStoreError::Validation {
+                field: "repetition",
+                message: "must be greater than zero".to_owned(),
+            });
+        }
+        validate_completed_run_field("adapter", &self.adapter)?;
+        if self.started_at_ms == 0 {
+            return Err(CompletedRunStoreError::Validation {
+                field: "started_at_ms",
+                message: "must be greater than zero".to_owned(),
+            });
+        }
+        if let Some(ended_at_ms) = self.ended_at_ms {
+            if ended_at_ms < self.started_at_ms {
+                return Err(CompletedRunStoreError::Validation {
+                    field: "ended_at_ms",
+                    message: "must be greater than or equal to started_at_ms".to_owned(),
+                });
+            }
+        }
+        if self.completed_at_unix == 0 {
+            return Err(CompletedRunStoreError::Validation {
+                field: "completed_at_unix",
+                message: "must be greater than zero".to_owned(),
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn is_completed(&self) -> bool {
+        self.status.is_completed()
+    }
+
+    pub fn to_completed_run(&self) -> Option<CompletedRun> {
+        self.is_completed()
+            .then(|| CompletedRun::new(&self.task_id, &self.profile_id, self.repetition))
     }
 }
 
@@ -155,6 +261,152 @@ impl fmt::Display for RunPlanError {
 }
 
 impl Error for RunPlanError {}
+
+#[derive(Debug)]
+pub enum CompletedRunStoreError {
+    Io(io::Error),
+    InvalidHeader {
+        found: String,
+    },
+    MalformedLine {
+        line: usize,
+        message: String,
+    },
+    Validation {
+        field: &'static str,
+        message: String,
+    },
+}
+
+impl fmt::Display for CompletedRunStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "completed run store I/O error: {error}"),
+            Self::InvalidHeader { found } => {
+                write!(formatter, "invalid completed run store header `{found}`")
+            }
+            Self::MalformedLine { line, message } => {
+                write!(
+                    formatter,
+                    "line {line}: malformed completed run record: {message}"
+                )
+            }
+            Self::Validation { field, message } => write!(formatter, "{field}: {message}"),
+        }
+    }
+}
+
+impl Error for CompletedRunStoreError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for CompletedRunStoreError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+pub fn completed_runs_path(root: impl AsRef<Path>) -> PathBuf {
+    root.as_ref().join(COMPLETED_RUNS_FILE_NAME)
+}
+
+pub fn completed_run_record_from_completion(
+    plan: &RunPlan,
+    completion: &CompletionRecord,
+    ended_at_ms: u64,
+) -> Result<CompletedRunRecord, CompletedRunStoreError> {
+    let run_id = plan.run_metadata.run_id.to_string();
+    if completion.run_id != run_id {
+        return Err(CompletedRunStoreError::Validation {
+            field: "run_id",
+            message: "completion record run_id must match the run plan".to_owned(),
+        });
+    }
+    if completion.task_id != plan.manifest_task_id {
+        return Err(CompletedRunStoreError::Validation {
+            field: "task_id",
+            message: "completion record task_id must match the run plan".to_owned(),
+        });
+    }
+
+    let repetition = match plan.selection {
+        RunSelection::Explicit => 1,
+        RunSelection::Next { repetition, .. } => repetition,
+    };
+
+    CompletedRunRecord::new(
+        run_id,
+        plan.manifest_task_id.clone(),
+        plan.profile_id.clone(),
+        repetition,
+        completion.status,
+        plan.run_metadata.adapter.clone(),
+        plan.run_metadata.started_at_ms,
+        Some(ended_at_ms),
+        completion.timestamp,
+    )
+}
+
+pub fn completed_runs_for_scheduler(records: &[CompletedRunRecord]) -> Vec<CompletedRun> {
+    records
+        .iter()
+        .filter_map(CompletedRunRecord::to_completed_run)
+        .collect()
+}
+
+pub fn read_completed_run_records(
+    path: impl AsRef<Path>,
+) -> Result<Vec<CompletedRunRecord>, CompletedRunStoreError> {
+    let path = path.as_ref();
+    match fs::read_to_string(path) {
+        Ok(contents) => parse_completed_run_records(&contents),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn write_completed_run_records(
+    path: impl AsRef<Path>,
+    records: &[CompletedRunRecord],
+) -> Result<(), CompletedRunStoreError> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serialize_completed_run_records(records))?;
+    Ok(())
+}
+
+pub fn append_completed_run_record(
+    path: impl AsRef<Path>,
+    record: &CompletedRunRecord,
+) -> Result<(), CompletedRunStoreError> {
+    record.validate()?;
+    let path = path.as_ref();
+    if !path.exists() {
+        return write_completed_run_records(path, std::slice::from_ref(record));
+    }
+
+    let mut file = OpenOptions::new().append(true).open(path)?;
+    writeln!(file, "{}", serialize_completed_run_record(record))?;
+    Ok(())
+}
+
+pub fn serialize_completed_run_records(records: &[CompletedRunRecord]) -> String {
+    let mut out = String::new();
+    out.push_str(COMPLETED_RUNS_HEADER);
+    out.push('\n');
+    for record in records {
+        out.push_str(&serialize_completed_run_record(record));
+        out.push('\n');
+    }
+    out
+}
 
 pub fn parse_run_args<I, S>(args: I) -> Result<RunCliArgs, RunPlanError>
 where
@@ -384,10 +636,191 @@ fn scheduler_profile(profile_id: &str) -> Result<SchedulerProfile, RunPlanError>
     }
 }
 
+fn parse_completed_run_records(
+    contents: &str,
+) -> Result<Vec<CompletedRunRecord>, CompletedRunStoreError> {
+    let mut lines = contents.lines();
+    let header = lines.next().unwrap_or_default();
+    if header != COMPLETED_RUNS_HEADER {
+        return Err(CompletedRunStoreError::InvalidHeader {
+            found: header.to_owned(),
+        });
+    }
+
+    lines
+        .enumerate()
+        .filter_map(|(offset, line)| {
+            let line_number = offset + 2;
+            (!line.trim().is_empty()).then(|| parse_completed_run_record_line(line_number, line))
+        })
+        .collect()
+}
+
+fn parse_completed_run_record_line(
+    line_number: usize,
+    line: &str,
+) -> Result<CompletedRunRecord, CompletedRunStoreError> {
+    let fields = line.split('\t').collect::<Vec<_>>();
+    if fields.len() != COMPLETED_RUNS_FIELD_COUNT {
+        return Err(CompletedRunStoreError::MalformedLine {
+            line: line_number,
+            message: format!(
+                "expected {COMPLETED_RUNS_FIELD_COUNT} tab-separated fields, got {}",
+                fields.len()
+            ),
+        });
+    }
+
+    let run_id = unescape_store_field(fields[0], line_number)?;
+    let task_id = unescape_store_field(fields[1], line_number)?;
+    let profile_id = unescape_store_field(fields[2], line_number)?;
+    let repetition = parse_usize_field("repetition", fields[3], line_number)?;
+    let status = CompletionStatus::parse(fields[4]).map_err(|error| {
+        CompletedRunStoreError::MalformedLine {
+            line: line_number,
+            message: error.to_string(),
+        }
+    })?;
+    let adapter = unescape_store_field(fields[5], line_number)?;
+    let started_at_ms = parse_u64_field("started_at_ms", fields[6], line_number)?;
+    let ended_at_ms = match fields[7] {
+        "-" => None,
+        value => Some(parse_u64_field("ended_at_ms", value, line_number)?),
+    };
+    let completed_at_unix = parse_u64_field("completed_at_unix", fields[8], line_number)?;
+
+    CompletedRunRecord::new(
+        run_id,
+        task_id,
+        profile_id,
+        repetition,
+        status,
+        adapter,
+        started_at_ms,
+        ended_at_ms,
+        completed_at_unix,
+    )
+}
+
+fn serialize_completed_run_record(record: &CompletedRunRecord) -> String {
+    [
+        escape_store_field(&record.run_id),
+        escape_store_field(&record.task_id),
+        escape_store_field(&record.profile_id),
+        record.repetition.to_string(),
+        record.status.as_str().to_owned(),
+        escape_store_field(&record.adapter),
+        record.started_at_ms.to_string(),
+        record
+            .ended_at_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned()),
+        record.completed_at_unix.to_string(),
+    ]
+    .join("\t")
+}
+
+fn parse_usize_field(
+    field: &'static str,
+    value: &str,
+    line: usize,
+) -> Result<usize, CompletedRunStoreError> {
+    value
+        .parse()
+        .map_err(|_| CompletedRunStoreError::MalformedLine {
+            line,
+            message: format!("{field} is not a positive integer"),
+        })
+}
+
+fn parse_u64_field(
+    field: &'static str,
+    value: &str,
+    line: usize,
+) -> Result<u64, CompletedRunStoreError> {
+    value
+        .parse()
+        .map_err(|_| CompletedRunStoreError::MalformedLine {
+            line,
+            message: format!("{field} is not an unsigned integer"),
+        })
+}
+
+fn validate_completed_run_field(
+    field: &'static str,
+    value: &str,
+) -> Result<(), CompletedRunStoreError> {
+    if value.trim().is_empty() {
+        return Err(CompletedRunStoreError::Validation {
+            field,
+            message: "must not be empty".to_owned(),
+        });
+    }
+
+    if value.trim() != value {
+        return Err(CompletedRunStoreError::Validation {
+            field,
+            message: "must not contain leading or trailing whitespace".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+fn escape_store_field(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn unescape_store_field(value: &str, line: usize) -> Result<String, CompletedRunStoreError> {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+
+        let Some(escaped) = chars.next() else {
+            return Err(CompletedRunStoreError::MalformedLine {
+                line,
+                message: "field ends with an incomplete escape".to_owned(),
+            });
+        };
+
+        match escaped {
+            '\\' => out.push('\\'),
+            't' => out.push('\t'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            _ => {
+                return Err(CompletedRunStoreError::MalformedLine {
+                    line,
+                    message: format!("unsupported escape sequence `\\{escaped}`"),
+                });
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::completion::CompletionStatus;
     use crate::core::CaptureMode;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn manifest() -> TaskManifest {
         TaskManifest {
@@ -407,6 +840,32 @@ mod tests {
             .with_repetitions(1)
             .with_run_identity(1_725_000_000_123, 7)
             .with_adapter("codex-cli")
+    }
+
+    fn temp_store_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "vc-tokmeter-cli-run-{name}-{}-{nonce}.tsv",
+            std::process::id()
+        ))
+    }
+
+    fn completed_record(task_id: &str, profile_id: &str, repetition: usize) -> CompletedRunRecord {
+        CompletedRunRecord::new(
+            format!("run-{task_id}-{profile_id}-{repetition}"),
+            task_id,
+            profile_id,
+            repetition,
+            CompletionStatus::Completed,
+            "codex-cli",
+            1_725_000_000_123,
+            Some(1_725_000_001_123),
+            1_725_000_002,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -500,5 +959,170 @@ mod tests {
         assert_ne!(next.mode_state.mode, CaptureMode::Passive);
         assert_eq!(explicit.mode_state.mode, CaptureMode::Task);
         assert_eq!(next.mode_state.mode, CaptureMode::Task);
+    }
+
+    #[test]
+    fn completed_run_store_round_trips_public_records() {
+        let path = temp_store_path("round-trip");
+        let records = vec![
+            completed_record("task-1", "baseline", 1),
+            CompletedRunRecord::new(
+                "run-task-1-treatment-1",
+                "task-1",
+                "treatment",
+                1,
+                CompletionStatus::Failed,
+                "codex-cli",
+                1_725_000_010_000,
+                Some(1_725_000_011_000),
+                1_725_000_012,
+            )
+            .unwrap(),
+        ];
+
+        write_completed_run_records(&path, &records).unwrap();
+        let serialized = fs::read_to_string(&path).unwrap();
+        let loaded = read_completed_run_records(&path).unwrap();
+
+        assert!(serialized.starts_with(COMPLETED_RUNS_HEADER));
+        assert_eq!(loaded, records);
+        assert_eq!(
+            completed_runs_for_scheduler(&loaded),
+            vec![CompletedRun::new("task-1", "baseline", 1)]
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn append_completed_run_record_keeps_versioned_format() {
+        let path = temp_store_path("append");
+        let first = completed_record("task-1", "baseline", 1);
+        let second = completed_record("task-1", "treatment", 1);
+
+        append_completed_run_record(&path, &first).unwrap();
+        append_completed_run_record(&path, &second).unwrap();
+
+        let serialized = fs::read_to_string(&path).unwrap();
+        let non_empty_lines = serialized
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+
+        assert_eq!(non_empty_lines, 3);
+        assert_eq!(
+            read_completed_run_records(&path).unwrap(),
+            vec![first, second]
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn shareable_completed_run_record_excludes_private_local_notes() {
+        let manifest = manifest();
+        let plan = plan_run(
+            ["--task", "task-1", "--profile", "baseline"],
+            &context(&manifest),
+        )
+        .unwrap();
+        let completion = CompletionRecord::new(
+            plan.run_metadata.run_id.to_string(),
+            "task-1",
+            "Done when the observable behavior passes.",
+            CompletionStatus::Completed,
+            Some("PRIVATE local debugging note"),
+            1_725_000_050,
+        )
+        .unwrap();
+        let record =
+            completed_run_record_from_completion(&plan, &completion, 1_725_000_051_123).unwrap();
+        let serialized = serialize_completed_run_records(&[record.clone()]);
+
+        assert_eq!(record.run_id, plan.run_metadata.run_id.to_string());
+        assert_eq!(record.task_id, "task-1");
+        assert_eq!(record.profile_id, "baseline");
+        assert_eq!(record.repetition, 1);
+        assert_eq!(record.status, CompletionStatus::Completed);
+        assert_eq!(record.adapter, "codex-cli");
+        assert_eq!(record.started_at_ms, 1_725_000_000_123);
+        assert_eq!(record.ended_at_ms, Some(1_725_000_051_123));
+        assert_eq!(record.completed_at_unix, 1_725_000_050);
+        assert!(!serialized.contains("PRIVATE local debugging note"));
+        assert!(!serialized.contains("local_note"));
+        assert!(!serialized.contains("done_condition"));
+    }
+
+    #[test]
+    fn next_selection_uses_completed_records_loaded_from_store() {
+        let path = temp_store_path("next-selection");
+        let records = vec![
+            completed_record("task-1", "baseline", 1),
+            completed_record("task-1", "treatment", 1),
+            completed_record("task-2", "baseline", 1),
+            CompletedRunRecord::new(
+                "run-task-2-treatment-failed",
+                "task-2",
+                "treatment",
+                1,
+                CompletionStatus::Failed,
+                "codex-cli",
+                1_725_000_020_000,
+                Some(1_725_000_021_000),
+                1_725_000_022,
+            )
+            .unwrap(),
+        ];
+        write_completed_run_records(&path, &records).unwrap();
+
+        let manifest = manifest();
+        let loaded_records = read_completed_run_records(&path).unwrap();
+        let completed_runs = completed_runs_for_scheduler(&loaded_records);
+        let context = context(&manifest).with_completed_runs(&completed_runs);
+        let plan = plan_run(["--next"], &context).unwrap();
+
+        assert_eq!(
+            plan.selection,
+            RunSelection::Next {
+                repetition: 1,
+                pending_before_selection: 17,
+            }
+        );
+        assert_eq!(plan.manifest_task_id, "task-2");
+        assert_eq!(plan.profile_id, "treatment");
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn persisted_records_have_metadata_needed_for_completed_run_report_math() {
+        let manifest = manifest();
+        let plan = plan_run(["--next"], &context(&manifest)).unwrap();
+        let completion = CompletionRecord::new(
+            plan.run_metadata.run_id.to_string(),
+            plan.manifest_task_id.clone(),
+            "Done when the task has a verifiable outcome.",
+            CompletionStatus::Completed,
+            Option::<String>::None,
+            1_725_000_060,
+        )
+        .unwrap();
+
+        let record =
+            completed_run_record_from_completion(&plan, &completion, 1_725_000_061_123).unwrap();
+
+        assert_eq!(record.run_id, plan.run_metadata.run_id.to_string());
+        assert_eq!(record.task_id, plan.manifest_task_id);
+        assert_eq!(record.profile_id, plan.profile_id);
+        assert_eq!(record.repetition, 1);
+        assert_eq!(record.status, CompletionStatus::Completed);
+        assert_eq!(record.adapter, "codex-cli");
+        assert_eq!(record.started_at_ms, plan.run_metadata.started_at_ms);
+        assert_eq!(record.ended_at_ms, Some(1_725_000_061_123));
+        assert_eq!(record.completed_at_unix, completion.timestamp);
+        assert_eq!(
+            record.to_completed_run(),
+            Some(CompletedRun::new("task-1", "baseline", 1))
+        );
     }
 }

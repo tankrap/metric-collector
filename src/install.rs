@@ -606,6 +606,43 @@ mod tests {
     }
 
     #[test]
+    fn hook_runtime_paths_are_residue_free_through_init_uninstall_planning() {
+        let request = request();
+        let existing = "theme = \"dark\"\n";
+        let plan = plan_init(&request, Some(existing)).unwrap();
+        let config = agent_config_after_init(Some(existing), &request);
+        let uninstall = plan_uninstall(&plan.records, Some(&config));
+
+        assert!(uninstall.is_residue_free_for_tokmeter_items());
+
+        for expected_path in [
+            request.hook_path(),
+            request.hooks_dir(),
+            request.manifest_path(),
+            request.runs_dir(),
+            request.tokmeter_dir(),
+        ] {
+            assert!(
+                uninstall
+                    .removals
+                    .iter()
+                    .any(|record| record.path == expected_path),
+                "missing uninstall removal for {}",
+                expected_path.display()
+            );
+        }
+
+        assert!(uninstall.removals.iter().any(|record| {
+            record.path == request.agent_config_path
+                && record.action == RemovalAction::RemoveManagedAgentConfigBlock
+        }));
+        assert_eq!(
+            agent_config_after_uninstall(Some(&config), &plan.records),
+            Some(ConfigAfterUninstall::Present(existing.to_string()))
+        );
+    }
+
+    #[test]
     fn failed_init_cleanup_removes_only_partial_records() {
         let request = request();
         let plan = plan_init(&request, Some("existing = true\n")).unwrap();

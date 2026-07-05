@@ -1,8 +1,7 @@
 use crate::classifier::{Classifier, Event};
-#[cfg(test)]
 use crate::core::EventLog;
 use crate::core::{
-    AttributedTokenEvent, CaptureMode, OperationClass, TokenCounts, ValidationError,
+    AttributedTokenEvent, CaptureMode, EventLogError, OperationClass, TokenCounts, ValidationError,
 };
 use crate::digest::digest_bytes;
 use crate::mode::{DEFAULT_PASSIVE_PROFILE_ID, ModeState};
@@ -79,6 +78,12 @@ pub struct CapturedHookEvents {
     pub events: Vec<AttributedTokenEvent>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutedHookPayload {
+    pub captured: CapturedHookEvents,
+    pub event_log_records: Vec<u8>,
+}
+
 pub fn capture_hook_payload(
     payload: &HookPayloadFields<'_>,
 ) -> Result<CapturedHookEvents, ValidationError> {
@@ -140,6 +145,22 @@ pub fn capture_hook_payload(
         argument_byte_count,
         result_byte_count,
         events,
+    })
+}
+
+pub fn execute_hook_payload(
+    payload: &HookPayloadFields<'_>,
+) -> Result<ExecutedHookPayload, EventLogError> {
+    let captured = capture_hook_payload(payload).map_err(EventLogError::Validation)?;
+    let mut event_log_records = Vec::new();
+
+    for event in &captured.events {
+        EventLog::append_event(&mut event_log_records, event)?;
+    }
+
+    Ok(ExecutedHookPayload {
+        captured,
+        event_log_records,
     })
 }
 
@@ -290,6 +311,8 @@ mod tests {
     const RAW_PATH_MARKER: &str = "/tmp/SECRET_RAW_PATH_MARKER/file.txt";
     const RAW_RESULT_MARKER: &str = "SECRET_RAW_RESULT_MARKER";
     const RAW_PROMPT_MARKER: &str = "SECRET_RAW_PROMPT_MARKER";
+    const RAW_COMMAND_MARKER: &str = "SECRET_RAW_COMMAND_MARKER";
+    const RAW_SOURCE_MARKER: &str = "fn SECRET_RAW_SOURCE_MARKER() {}";
 
     #[test]
     fn captures_argument_and_result_as_valid_events_without_raw_payloads() {
@@ -342,6 +365,45 @@ mod tests {
         }
         assert!(output.contains("tool=Read.arguments"));
         assert!(output.contains("tool=Read.result"));
+    }
+
+    #[test]
+    fn executed_hook_payload_returns_appendable_privacy_safe_event_log_records() {
+        let payload = HookPayloadFields {
+            metadata: HookCaptureMetadata::new(5, "run-5", "task-5", "profile-5"),
+            tool_name: "Bash",
+            command: Some(RAW_COMMAND_MARKER),
+            arguments: Some(RAW_ARG_MARKER),
+            result: Some(RAW_SOURCE_MARKER),
+            tokens: TokenCounts::new(13, 21, 1, 2),
+        };
+
+        let executed = execute_hook_payload(&payload).expect("hook payload executes");
+        assert_eq!(executed.captured.events.len(), 2);
+
+        let serialized =
+            String::from_utf8(executed.event_log_records.clone()).expect("event log is utf8");
+        let parsed = EventLog::read_from(serialized.as_bytes()).expect("event log parses");
+        assert_eq!(parsed.events, executed.captured.events);
+
+        for marker in [
+            RAW_COMMAND_MARKER,
+            RAW_ARG_MARKER,
+            RAW_SOURCE_MARKER,
+            RAW_PATH_MARKER,
+            RAW_RESULT_MARKER,
+            RAW_PROMPT_MARKER,
+        ] {
+            assert!(
+                !serialized.contains(marker),
+                "serialized output leaked {marker}"
+            );
+        }
+
+        assert!(serialized.contains("adapter=claude-code-hook"));
+        assert!(serialized.contains("op_class=other"));
+        assert!(serialized.contains("tool=Bash.arguments"));
+        assert!(serialized.contains("tool=Bash.result"));
     }
 
     #[test]

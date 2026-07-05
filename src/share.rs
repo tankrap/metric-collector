@@ -47,6 +47,13 @@ pub fn sanitize_report(value: &ShareValue, salt: &str) -> ShareValue {
     ShareSanitizer::new(salt).sanitize(value)
 }
 
+pub fn serialize_share_value(value: &ShareValue) -> String {
+    let mut out = String::new();
+    write_share_value(&mut out, value);
+    out.push('\n');
+    out
+}
+
 /// Returns a salted, deterministic identifier for a sensitive value.
 ///
 /// This is a stdlib-only FNV-1a fallback so share mode has stable local
@@ -108,6 +115,61 @@ fn sanitize_value(value: &ShareValue, sanitizer: &ShareSanitizer) -> ShareValue 
         | ShareValue::Bool(_)
         | ShareValue::Null => value.clone(),
     }
+}
+
+fn write_share_value(out: &mut String, value: &ShareValue) {
+    match value {
+        ShareValue::Map(map) => write_share_map(out, map),
+        ShareValue::List(values) => {
+            out.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_share_value(out, value);
+            }
+            out.push(']');
+        }
+        ShareValue::String(value) => write_json_string(out, value),
+        ShareValue::U64(value) => out.push_str(&value.to_string()),
+        ShareValue::I64(value) => out.push_str(&value.to_string()),
+        ShareValue::F64(value) if value.is_finite() => out.push_str(&value.to_string()),
+        ShareValue::F64(_) => out.push_str("null"),
+        ShareValue::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
+        ShareValue::Null => out.push_str("null"),
+    }
+}
+
+fn write_share_map(out: &mut String, map: &ShareMap) {
+    out.push('{');
+    for (index, (key, value)) in map.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        write_json_string(out, key);
+        out.push(':');
+        write_share_value(out, value);
+    }
+    out.push('}');
+}
+
+fn write_json_string(out: &mut String, value: &str) {
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => {
+                out.push_str("\\u");
+                out.push_str(&format!("{:04x}", ch as u32));
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
 }
 
 fn sanitize_map(map: &ShareMap, sanitizer: &ShareSanitizer) -> ShareValue {
@@ -540,5 +602,35 @@ mod tests {
         assert!(rendered.contains("message_hash"));
         assert!(rendered.contains("path_hash"));
         assert!(rendered.contains("completed"));
+    }
+
+    #[test]
+    fn serializes_share_value_as_json_without_non_finite_numbers() {
+        let value = ShareValue::Map(
+            [
+                ("schema_version".to_owned(), ShareValue::U64(1)),
+                (
+                    "artifact_type".to_owned(),
+                    ShareValue::String("report".to_owned()),
+                ),
+                (
+                    "values".to_owned(),
+                    ShareValue::List(vec![
+                        ShareValue::Bool(true),
+                        ShareValue::F64(f64::NAN),
+                        ShareValue::Null,
+                    ]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let serialized = serialize_share_value(&value);
+
+        assert_eq!(
+            serialized,
+            "{\"artifact_type\":\"report\",\"schema_version\":1,\"values\":[true,null,null]}\n"
+        );
     }
 }

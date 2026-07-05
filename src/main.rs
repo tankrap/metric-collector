@@ -2,9 +2,15 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use vc_tokmeter::cli_report::{create_first_report_artifacts, render_report_output_paths};
-use vc_tokmeter::cli_run::{RunPlanContext, plan_run};
+use vc_tokmeter::cli_report::{
+    create_first_report_artifacts, create_report_share_artifact, render_report_output_paths,
+};
+use vc_tokmeter::cli_run::{
+    RunPlanContext, completed_runs_for_scheduler, completed_runs_path, plan_run,
+    read_completed_run_records,
+};
 use vc_tokmeter::doctor::{DoctorCheck, DoctorReport};
 use vc_tokmeter::install::{
     ConfigAfterUninstall, InitPlan, InitRequest, InstallAction, InstallItemKind, RemovalAction,
@@ -120,13 +126,20 @@ fn command_doctor() -> Result<(), String> {
 
 fn command_run(args: &[String]) -> Result<(), String> {
     let manifest = default_task_manifest();
+    let runs_dir = current_dir()?.join(".tokmeter").join("runs");
+    let completed_record_path = completed_runs_path(&runs_dir);
+    let completed_records = read_completed_run_records(&completed_record_path)
+        .map_err(|error| format!("cannot read completed runs: {error}"))?;
+    let completed_runs = completed_runs_for_scheduler(&completed_records);
     let context = RunPlanContext::new(&manifest)
+        .with_completed_runs(&completed_runs)
         .with_repetitions(2)
-        .with_run_identity(1, 1)
+        .with_run_identity(unix_time_ms(), completed_records.len() as u64 + 1)
         .with_adapter("tokmeter-cli");
     let plan = plan_run(args.iter().map(String::as_str), &context).map_err(|e| e.to_string())?;
     print!("{}", plan.output);
     println!("Mode T active: events from this run are stamped with mode=task.");
+    println!("Run progress store: {}", completed_record_path.display());
     println!("Completion prompt: record pass/fail against the task done condition after the run.");
     Ok(())
 }
@@ -135,9 +148,18 @@ fn command_report(args: &[String]) -> Result<(), String> {
     let out_dir = value_after(args, "--out")
         .map(PathBuf::from)
         .unwrap_or(current_dir()?);
-    let artifacts = create_first_report_artifacts(&out_dir, Option::<&std::path::Path>::None)
+    let event_log = value_after(args, "--event-log")
+        .map(PathBuf::from)
+        .unwrap_or(default_event_log_path()?);
+    let artifacts = create_first_report_artifacts(&out_dir, Some(event_log.as_path()))
         .map_err(|error| format!("cannot create report artifacts: {error}"))?;
     println!("{}", render_report_output_paths(&artifacts.paths));
+    if has_flag(args, "--share") {
+        let salt = value_after(args, "--salt").unwrap_or("local-share");
+        let share_path = create_report_share_artifact(&artifacts, salt)
+            .map_err(|error| format!("cannot create share artifact: {error}"))?;
+        println!("report.share.json: {}", share_path.display());
+    }
     println!("Evidence: Grade O observational; no savings headline is emitted.");
     Ok(())
 }
@@ -230,10 +252,26 @@ fn current_dir() -> Result<PathBuf, String> {
     env::current_dir().map_err(|error| format!("cannot read current directory: {error}"))
 }
 
+fn default_event_log_path() -> Result<PathBuf, String> {
+    Ok(current_dir()?.join(".tokmeter").join("events.jsonl"))
+}
+
 fn value_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.windows(2)
         .find(|window| window[0] == flag)
         .map(|window| window[1].as_str())
+}
+
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|arg| arg == flag)
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(1)
+        .max(1)
 }
 
 fn default_task_manifest() -> TaskManifest {

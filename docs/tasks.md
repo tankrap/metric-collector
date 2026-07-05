@@ -29,6 +29,20 @@ Each task needs:
 Use 5 to 15 tasks per Mode T comparison. Keep descriptions to one line because
 the current parser accepts only single-line scalar values.
 
+## Run Progress Records
+
+Mode T run progress is stored as `completed-runs.tsv`. The file is versioned and
+contains only public run metadata: run ID, task ID, profile, repetition,
+completion status, adapter, and timing fields.
+
+`run --next` scheduling should use only records whose status is `completed`.
+Failed or aborted records remain useful for report math, but they do not advance
+the interleaved baseline/treatment scheduler.
+
+Local completion notes are never written to this shared progress file. Keep
+private debugging context in local notes only, not in task titles or done
+conditions.
+
 ## Writing Done Conditions
 
 Write done conditions as observable outcomes, not implementation notes. Good
