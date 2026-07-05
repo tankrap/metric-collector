@@ -28,6 +28,7 @@ pub mod rules;
 pub mod run;
 pub mod scheduler;
 pub mod share;
+pub mod structured_import;
 pub mod tasks;
 pub mod token_estimator;
 pub mod transcript;

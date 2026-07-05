@@ -27,6 +27,7 @@ pub struct ProxyConfig {
     pub bind_port: u16,
     pub upstream_url: String,
     pub event_log_path: Option<PathBuf>,
+    pub adapter_label: String,
 }
 
 impl ProxyConfig {
@@ -46,11 +47,20 @@ impl ProxyConfig {
             bind_port,
             upstream_url: upstream_url.into(),
             event_log_path: None,
+            adapter_label: "proxy".to_owned(),
         })
     }
 
     pub fn with_event_log_path(mut self, event_log_path: impl Into<PathBuf>) -> Self {
         self.event_log_path = Some(event_log_path.into());
+        self
+    }
+
+    pub fn with_adapter_label(mut self, adapter_label: impl Into<String>) -> Self {
+        let adapter_label = adapter_label.into();
+        if !adapter_label.trim().is_empty() {
+            self.adapter_label = adapter_label;
+        }
         self
     }
 }
@@ -170,6 +180,20 @@ pub fn process_proxy_exchange_with_mode(
     provider_response_json: &str,
     mode_state: &ModeState,
 ) -> Result<ProxyCapture, ProxyRuntimeError> {
+    process_proxy_exchange_with_mode_and_adapter(
+        raw_request,
+        provider_response_json,
+        mode_state,
+        "proxy",
+    )
+}
+
+fn process_proxy_exchange_with_mode_and_adapter(
+    raw_request: &str,
+    provider_response_json: &str,
+    mode_state: &ModeState,
+    adapter_label: &str,
+) -> Result<ProxyCapture, ProxyRuntimeError> {
     let request = parse_http_request(raw_request)?;
     let path = sanitize_request_path(&request.path);
     let redacted_headers = redact_sensitive_headers(&request.headers);
@@ -177,7 +201,7 @@ pub fn process_proxy_exchange_with_mode(
     let redacted_response = redact_provider_error(provider_response_json);
     let events = attribute_proxy_json_with_mode(&request.body, &redacted_response, mode_state);
     let mut core_events =
-        core_events_from_proxy_events(&events, usage, current_timestamp_ms(), "proxy");
+        core_events_from_proxy_events(&events, usage, current_timestamp_ms(), adapter_label);
     if core_events.is_empty() {
         core_events.extend(estimated_proxy_payload_event(
             provider_response_json,
@@ -283,7 +307,12 @@ pub fn forward_proxy_request_with_mode(
     let upstream_request = build_upstream_request(raw_request, &upstream)?;
     let response_bytes = send_upstream_request(&upstream, &upstream_request)?;
     let response_body = response_body_string(&response_bytes);
-    let capture = process_proxy_exchange_with_mode(raw_request, &response_body, mode_state)?;
+    let capture = process_proxy_exchange_with_mode_and_adapter(
+        raw_request,
+        &response_body,
+        mode_state,
+        &config.adapter_label,
+    )?;
 
     Ok(ProxyForwardedExchange {
         response_bytes,
@@ -1670,6 +1699,34 @@ mod tests {
             config.event_log_path,
             Some(std::path::PathBuf::from("/tmp/tokmeter-proxy-events.jsonl"))
         );
+    }
+
+    #[test]
+    fn proxy_config_can_label_exact_usage_for_specific_adapter() {
+        let config = ProxyConfig::new("127.0.0.1", 17684, "https://api.anthropic.com")
+            .unwrap()
+            .with_adapter_label("proxy.claude.anthropic");
+
+        assert_eq!(config.adapter_label, "proxy.claude.anthropic");
+    }
+
+    #[test]
+    fn custom_adapter_label_is_used_for_exact_http_usage_events() {
+        let request = concat!("POST /v1/messages HTTP/1.1\r\n", "\r\n", "{}");
+        let response = r#"{"usage":{"input_tokens":17,"output_tokens":5}}"#;
+
+        let capture = process_proxy_exchange_with_mode_and_adapter(
+            request,
+            response,
+            &ModeState::passive(),
+            "proxy.claude.anthropic",
+        )
+        .unwrap();
+
+        assert_eq!(capture.core_events.len(), 1);
+        assert_eq!(capture.core_events[0].adapter, "proxy.claude.anthropic");
+        assert_eq!(capture.core_events[0].tokens.input_tokens, 17);
+        assert_eq!(capture.core_events[0].tokens.output_tokens, 5);
     }
 
     #[test]

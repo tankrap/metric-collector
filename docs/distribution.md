@@ -100,6 +100,30 @@ cargo run --manifest-path /Users/justin/metrics/Cargo.toml -- report \
   --out .tokmeter/report
 ```
 
+## Claude Code Proxy Wrapper
+
+For long Claude Code sessions, use the wrapper so the proxy and report path are
+managed for the whole interactive session:
+
+```sh
+cargo run --manifest-path /Users/justin/metrics/Cargo.toml -- claude-code
+```
+
+The wrapper starts the localhost proxy on port `17684`, sets
+`ANTHROPIC_BASE_URL` for the launched `claude` process, removes
+`ANTHROPIC_API_KEY` by default so subscription login is not accidentally
+overridden, and writes a report after Claude exits. Use
+`--keep-anthropic-api-key` for intentional API-key testing.
+
+Pass Claude Code arguments after `--`:
+
+```sh
+cargo run --manifest-path /Users/justin/metrics/Cargo.toml -- claude-code -- \
+  --model sonnet
+```
+
+See [claude-code.md](claude-code.md) for full setup notes and caveats.
+
 ## Static Binary
 
 Planned v1 install path:

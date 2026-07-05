@@ -58,6 +58,16 @@ cargo run --manifest-path /Users/justin/metrics/Cargo.toml -- codex-tui \
   --keep-openai-api-key
 ```
 
+For long interactive Claude Code sessions:
+
+```sh
+cargo run --manifest-path /Users/justin/metrics/Cargo.toml -- claude-code
+```
+
+This starts the Anthropic proxy path, launches the normal `claude` CLI, appends
+events to `.tokmeter/events.jsonl`, and writes a report after Claude exits. See
+[claude-code.md](claude-code.md) for API-key and subscription mode caveats.
+
 If you prefer to manage terminals yourself, you can still run the proxy
 directly in one terminal and Codex in another:
 
@@ -147,6 +157,12 @@ when you want to compare git volume with non-git classes such as file reads,
 edit echoes, test output, and build output. Use `token_sources` when you want
 to separate hook records, exact proxy usage, estimated proxy records, transcript
 imports, and request/response direction where the adapter provides it.
+
+Reports also include `Session git token share`, which summarizes total session
+tokens, git tokens, non-git tokens, git share, and whether the token counts are
+exact, estimated, mixed, or unknown. See
+[adapter-fidelity.md](adapter-fidelity.md) for the support matrix across Codex,
+Claude, desktop apps, MCP tools, and structured imports.
 
 For Claude Desktop and other MCP-capable desktop apps, use the local MCP git
 adapter so git operations flow through tokmeter-managed tools. See

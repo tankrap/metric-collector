@@ -27,6 +27,9 @@ use vc_tokmeter::install::{
 };
 use vc_tokmeter::mcp_git::{McpGitConfig, run_mcp_git_server};
 use vc_tokmeter::proxy::{ProxyConfig, run_proxy, serve_proxy_listener};
+use vc_tokmeter::structured_import::{
+    StructuredUsageDefaults, append_codex_exec_jsonl_to_event_log,
+};
 use vc_tokmeter::tasks::{Task, TaskManifest};
 
 fn main() {
@@ -44,9 +47,11 @@ fn main() {
         }
         Some("init") => command_init(),
         Some("hook") => command_hook(&args),
+        Some("import-usage") => command_import_usage(&args),
         Some("mcp-git") => command_mcp_git(&args),
         Some("proxy") => command_proxy(&args),
         Some("codex-tui") => command_codex_tui(&args),
+        Some("claude-code") => command_claude_code(&args),
         Some("run") => command_run(&args),
         Some("report") => command_report(&args),
         Some("status") => {
@@ -76,9 +81,12 @@ Usage:
 Commands:
   init       Plan local passive capture wiring
   hook       Execute a local agent hook payload from stdin
+  import-usage
+             Import structured usage JSONL into the event log
   mcp-git    Run stdio MCP git tools for desktop apps
   proxy      Run the localhost-only provider proxy
   codex-tui  Launch interactive Codex through the local proxy
+  claude-code Launch interactive Claude Code through the local proxy
   run        Enter comparison protocol (Mode T) for a task/profile
   report     Generate local Grade O report artifacts
   status     Show current capture mode and today's local summary
@@ -257,6 +265,60 @@ fn command_hook(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn command_import_usage(args: &[String]) -> Result<(), String> {
+    let event_log = value_after(args, "--event-log")
+        .map(PathBuf::from)
+        .unwrap_or(default_event_log_path()?);
+    let mut input = String::new();
+    if let Some(source) = value_after(args, "--source") {
+        input = fs::read_to_string(source)
+            .map_err(|error| format!("cannot read usage source {source}: {error}"))?;
+    } else {
+        io::stdin()
+            .read_to_string(&mut input)
+            .map_err(|error| format!("cannot read usage JSONL from stdin: {error}"))?;
+    }
+
+    let defaults = StructuredUsageDefaults {
+        timestamp_ms: unix_time_ms(),
+        run_id: value_after(args, "--run-id")
+            .unwrap_or("imported-codex-exec")
+            .to_owned(),
+        task_id: value_after(args, "--task-id").unwrap_or("adhoc").to_owned(),
+        profile_id: value_after(args, "--profile-id")
+            .unwrap_or("adhoc")
+            .to_owned(),
+        adapter: value_after(args, "--adapter")
+            .unwrap_or("import.codex.exec")
+            .to_owned(),
+    };
+
+    let summary = append_codex_exec_jsonl_to_event_log(&input, &event_log, &defaults)
+        .map_err(|error| format!("cannot import structured usage: {error}"))?;
+
+    println!(
+        "usage events imported: {} skipped_duplicates={} diagnostics={} event_log={}",
+        summary.imported,
+        summary.skipped_duplicates,
+        summary.diagnostics.len(),
+        event_log.display()
+    );
+    for diagnostic in summary.diagnostics.iter().take(5) {
+        println!(
+            "diagnostic line={} kind={}",
+            diagnostic.line, diagnostic.kind
+        );
+    }
+    if summary.diagnostics.len() > 5 {
+        println!(
+            "diagnostics truncated: {} more",
+            summary.diagnostics.len().saturating_sub(5)
+        );
+    }
+
+    Ok(())
+}
+
 fn command_mcp_git(args: &[String]) -> Result<(), String> {
     let event_log = value_after(args, "--event-log")
         .map(PathBuf::from)
@@ -379,6 +441,88 @@ fn command_codex_tui(args: &[String]) -> Result<(), String> {
     } else {
         Err(format!(
             "codex exited with {}",
+            status
+                .code()
+                .map(|code| format!("code {code}"))
+                .unwrap_or_else(|| "signal".to_owned())
+        ))
+    }
+}
+
+fn command_claude_code(args: &[String]) -> Result<(), String> {
+    let (session_args, claude_args) = split_passthrough_args(args);
+    let bind_host = value_after(session_args, "--bind-host").unwrap_or("127.0.0.1");
+    let bind_port = value_after(session_args, "--port")
+        .unwrap_or("17684")
+        .parse::<u16>()
+        .map_err(|error| format!("invalid --port: {error}"))?;
+    let upstream = value_after(session_args, "--upstream").unwrap_or("https://api.anthropic.com");
+    let event_log = value_after(session_args, "--event-log")
+        .map(PathBuf::from)
+        .unwrap_or(default_event_log_path()?);
+    let report_out = value_after(session_args, "--out")
+        .map(PathBuf::from)
+        .unwrap_or(current_dir()?.join(".tokmeter").join("report"));
+    let claude_bin = value_after(session_args, "--claude-bin").unwrap_or("claude");
+    let keep_anthropic_api_key = has_flag(session_args, "--keep-anthropic-api-key");
+
+    if let Some(parent) = event_log.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    }
+
+    let config = ProxyConfig::new(bind_host, bind_port, upstream)
+        .map_err(|error| error.to_string())?
+        .with_event_log_path(event_log.clone())
+        .with_adapter_label("proxy.claude.anthropic");
+    let listener = TcpListener::bind((config.bind_host.as_str(), config.bind_port))
+        .map_err(|error| format!("cannot bind proxy: {error}"))?;
+    let anthropic_base_url = claude_anthropic_base_url(&config.bind_host, config.bind_port);
+    let proxy_config = config.clone();
+
+    println!(
+        "tokmeter proxy listening on {}:{} -> {}",
+        config.bind_host, config.bind_port, config.upstream_url
+    );
+    println!("tokmeter event log: {}", event_log.display());
+    println!("claude env override: ANTHROPIC_BASE_URL=\"{anthropic_base_url}\"");
+    println!(
+        "report while Claude Code is running: vc-tokmeter report --event-log {} --out {}",
+        event_log.display(),
+        report_out.display()
+    );
+
+    thread::spawn(move || {
+        if let Err(error) = serve_proxy_listener(proxy_config, listener) {
+            eprintln!("tokmeter proxy failed: {error}");
+        }
+    });
+    thread::sleep(Duration::from_millis(150));
+
+    let mut command = Command::new(claude_bin);
+    command.env("ANTHROPIC_BASE_URL", &anthropic_base_url);
+    command.args(claude_args);
+    if !keep_anthropic_api_key {
+        command.env_remove("ANTHROPIC_API_KEY");
+    }
+
+    let status = command
+        .status()
+        .map_err(|error| format!("cannot launch {claude_bin}: {error}"))?;
+
+    match create_first_report_artifacts(&report_out, Some(event_log.as_path())) {
+        Ok(artifacts) => {
+            println!("{}", render_report_output_paths(&artifacts.paths));
+            println!("Evidence: Grade O observational; no savings headline is emitted.");
+        }
+        Err(error) => eprintln!("cannot create report artifacts: {error}"),
+    }
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "claude exited with {}",
             status
                 .code()
                 .map(|code| format!("code {code}"))
@@ -558,6 +702,10 @@ fn split_passthrough_args(args: &[String]) -> (&[String], &[String]) {
         Some(index) => (&args[..index], &args[index + 1..]),
         None => (args, &[]),
     }
+}
+
+fn claude_anthropic_base_url(bind_host: &str, bind_port: u16) -> String {
+    format!("http://{bind_host}:{bind_port}")
 }
 
 fn default_event_log_path() -> Result<PathBuf, String> {
@@ -757,5 +905,29 @@ mod tests {
 
         assert_eq!(session_args, &input[..2]);
         assert_eq!(codex_args, &input[3..]);
+    }
+
+    #[test]
+    fn claude_code_uses_anthropic_base_url_without_api_path_suffix() {
+        assert_eq!(
+            claude_anthropic_base_url("127.0.0.1", 17684),
+            "http://127.0.0.1:17684"
+        );
+    }
+
+    #[test]
+    fn claude_code_splits_passthrough_args_after_double_dash() {
+        let input = args(&[
+            "--event-log",
+            ".tokmeter/events.jsonl",
+            "--",
+            "--model",
+            "sonnet",
+            "start from git status",
+        ]);
+        let (session_args, claude_args) = split_passthrough_args(&input);
+
+        assert_eq!(session_args, &input[..2]);
+        assert_eq!(claude_args, &input[3..]);
     }
 }

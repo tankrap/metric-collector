@@ -1165,6 +1165,8 @@ fn token_source_label(event: &AttributedTokenEvent) -> &'static str {
             "response" => "transcript response",
             _ => "transcript import",
         }
+    } else if adapter == "import.codex.exec" {
+        "codex exec exact usage"
     } else if adapter.starts_with("mcp.") {
         match direction {
             "request" => "mcp tool request",
@@ -1634,6 +1636,37 @@ mod tests {
         assert!(markdown.contains(
             "| Action subtype | Direction | Operation class | Evidence | Events | Total tokens |"
         ));
+    }
+
+    #[test]
+    fn imported_codex_exec_usage_is_reported_as_exact_token_source() {
+        let output_dir = temp_output_dir("codex-exec-import-log");
+        fs::create_dir_all(&output_dir).unwrap();
+        let event_log = output_dir.join("events.jsonl");
+        let mut imported = event(
+            "session-1",
+            "adhoc",
+            "adhoc",
+            OperationClass::SessionMeta,
+            TokenCounts::new(100, 25, 0, 0),
+            256,
+            None,
+        );
+        imported.mode = CaptureMode::Passive;
+        imported.adapter = "import.codex.exec".to_owned();
+        imported.tool = "codex.exec".to_owned();
+        imported.direction = Some("summary".to_owned());
+        write_event_log(&event_log, &[imported]);
+
+        let artifacts = create_first_report_artifacts(&output_dir, Some(&event_log)).unwrap();
+
+        let json = fs::read_to_string(&artifacts.paths.report_json).unwrap();
+        let markdown = fs::read_to_string(&artifacts.paths.report_markdown).unwrap();
+        assert!(json.contains("\"source\": \"codex exec exact usage\""));
+        assert!(markdown.contains(
+            "| codex exec exact usage | Grade O | 1 | 125 | 100 | 25 | 0 | 0 | 256 | 100.0% |"
+        ));
+        assert!(markdown.contains("| Token fidelity | Grade O | exact |"));
     }
 
     #[test]

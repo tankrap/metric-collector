@@ -61,16 +61,36 @@ cargo run --manifest-path /path/to/metric-collector/Cargo.toml -- report \
 To capture provider-reported token counts instead of hook byte/digest evidence,
 run Codex through `tokmeter proxy`; see
 [docs/distribution.md](docs/distribution.md#local-proxy-runtime).
+To import exact usage from non-interactive Codex runs without scraping console
+text, save `codex exec --json` JSONL and import it:
+
+```sh
+cargo run --manifest-path /path/to/metric-collector/Cargo.toml -- import-usage \
+  --source codex-events.jsonl \
+  --event-log .tokmeter/events.jsonl
+```
+
 For the study workflow that measures passive AI-assisted git token volume, see
 [docs/study-workflow.md](docs/study-workflow.md).
 For Claude Desktop and other MCP-capable desktop apps, see
 [docs/desktop-mcp.md](docs/desktop-mcp.md).
+For exact, estimated, and mixed token fidelity across Codex, Claude, desktop
+apps, and imports, see [docs/adapter-fidelity.md](docs/adapter-fidelity.md).
 For long interactive Codex TUI sessions, use the wrapper so collection runs for
 the full session:
 
 ```sh
 cargo run --manifest-path /path/to/metric-collector/Cargo.toml -- codex-tui
 ```
+
+For long interactive Claude Code sessions, use the Anthropic proxy wrapper:
+
+```sh
+cargo run --manifest-path /path/to/metric-collector/Cargo.toml -- claude-code
+```
+
+See [docs/claude-code.md](docs/claude-code.md) for API-key and subscription
+mode caveats.
 
 Passive mode is the product path. The five-minute setup test measures this
 path: install, initialize local capture, check status, and produce the first
