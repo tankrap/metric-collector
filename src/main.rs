@@ -1,22 +1,28 @@
 use std::env;
 use std::fs;
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vc_tokmeter::cli_report::{
-    create_first_report_artifacts, create_report_share_artifact, render_report_output_paths,
+    create_compare_report_artifacts, create_first_report_artifacts, create_report_share_artifact,
+    render_report_output_paths,
 };
 use vc_tokmeter::cli_run::{
-    RunPlanContext, completed_runs_for_scheduler, completed_runs_path, plan_run,
-    read_completed_run_records,
+    RunPlanContext, WrappedRunOptions, completed_runs_for_scheduler, completed_runs_path,
+    completion_decision_from_command_outcome, execute_process_command, execute_wrapped_run,
+    plan_run, read_completed_run_records,
 };
+use vc_tokmeter::completion::{CompletionStatus, prompt_completion_status_from_stdin};
 use vc_tokmeter::doctor::{DoctorCheck, DoctorReport};
+use vc_tokmeter::hook_capture::{HookRuntimeRequest, execute_hook_runtime};
 use vc_tokmeter::install::{
     ConfigAfterUninstall, InitPlan, InitRequest, InstallAction, InstallItemKind, RemovalAction,
     UninstallPlan, agent_config_after_init, agent_config_after_uninstall, plan_init,
     plan_uninstall, render_init_summary, render_uninstall_summary,
 };
+use vc_tokmeter::proxy::{ProxyConfig, run_proxy};
 use vc_tokmeter::tasks::{Task, TaskManifest};
 
 fn main() {
@@ -33,6 +39,8 @@ fn main() {
             Ok(())
         }
         Some("init") => command_init(),
+        Some("hook") => command_hook(&args),
+        Some("proxy") => command_proxy(&args),
         Some("run") => command_run(&args),
         Some("report") => command_report(&args),
         Some("status") => {
@@ -61,6 +69,8 @@ Usage:
 
 Commands:
   init       Plan local passive capture wiring
+  hook       Execute a local agent hook payload from stdin
+  proxy      Run the localhost-only provider proxy
   run        Enter comparison protocol (Mode T) for a task/profile
   report     Generate local Grade O report artifacts
   status     Show current capture mode and today's local summary
@@ -125,6 +135,7 @@ fn command_doctor() -> Result<(), String> {
 }
 
 fn command_run(args: &[String]) -> Result<(), String> {
+    let (run_args, command_args) = split_wrapped_command(args);
     let manifest = default_task_manifest();
     let runs_dir = current_dir()?.join(".tokmeter").join("runs");
     let completed_record_path = completed_runs_path(&runs_dir);
@@ -136,7 +147,47 @@ fn command_run(args: &[String]) -> Result<(), String> {
         .with_repetitions(2)
         .with_run_identity(unix_time_ms(), completed_records.len() as u64 + 1)
         .with_adapter("tokmeter-cli");
-    let plan = plan_run(args.iter().map(String::as_str), &context).map_err(|e| e.to_string())?;
+
+    if let Some((program, program_args)) = command_args.split_first() {
+        let done_condition =
+            "Done when the wrapped command exits and the task has an observable result.";
+        let options = WrappedRunOptions::new(
+            &completed_record_path,
+            done_condition,
+            unix_time_ms(),
+            unix_time_seconds(),
+        )
+        .with_completion_fallback(CompletionStatus::Aborted);
+        let result = execute_wrapped_run(
+            run_args.iter().map(String::as_str),
+            &context,
+            &options,
+            |_plan| execute_process_command(program, program_args.iter().cloned()),
+            |_plan, command| {
+                let fallback = completion_decision_from_command_outcome(command).status;
+                prompt_completion_status_from_stdin(done_condition, fallback)
+                    .unwrap_or_else(|_| completion_decision_from_command_outcome(command))
+            },
+        )
+        .map_err(|error| error.to_string())?;
+
+        print!("{}", result.plan.output);
+        println!(
+            "Wrapped command exited: succeeded={} exit_code={}",
+            result.command.succeeded,
+            result
+                .command
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".to_owned())
+        );
+        println!("Completion status: {}", result.completion.status);
+        println!("Run progress store: {}", completed_record_path.display());
+        return Ok(());
+    }
+
+    let plan =
+        plan_run(run_args.iter().map(String::as_str), &context).map_err(|e| e.to_string())?;
     print!("{}", plan.output);
     println!("Mode T active: events from this run are stamped with mode=task.");
     println!("Run progress store: {}", completed_record_path.display());
@@ -151,8 +202,16 @@ fn command_report(args: &[String]) -> Result<(), String> {
     let event_log = value_after(args, "--event-log")
         .map(PathBuf::from)
         .unwrap_or(default_event_log_path()?);
-    let artifacts = create_first_report_artifacts(&out_dir, Some(event_log.as_path()))
-        .map_err(|error| format!("cannot create report artifacts: {error}"))?;
+    let artifacts = if has_flag(args, "--compare") {
+        let completed_runs = value_after(args, "--completed-runs")
+            .map(PathBuf::from)
+            .unwrap_or(default_completed_runs_path()?);
+        create_compare_report_artifacts(&out_dir, event_log.as_path(), completed_runs.as_path())
+            .map_err(|error| format!("cannot create compare report artifacts: {error}"))?
+    } else {
+        create_first_report_artifacts(&out_dir, Some(event_log.as_path()))
+            .map_err(|error| format!("cannot create report artifacts: {error}"))?
+    };
     println!("{}", render_report_output_paths(&artifacts.paths));
     if has_flag(args, "--share") {
         let salt = value_after(args, "--salt").unwrap_or("local-share");
@@ -162,6 +221,46 @@ fn command_report(args: &[String]) -> Result<(), String> {
     }
     println!("Evidence: Grade O observational; no savings headline is emitted.");
     Ok(())
+}
+
+fn command_hook(args: &[String]) -> Result<(), String> {
+    let event_log = value_after(args, "--event-log")
+        .map(PathBuf::from)
+        .unwrap_or(default_event_log_path()?);
+    let mut stdin_payload = String::new();
+    io::stdin()
+        .read_to_string(&mut stdin_payload)
+        .map_err(|error| format!("cannot read hook payload from stdin: {error}"))?;
+    let request = HookRuntimeRequest::new(
+        event_log.clone(),
+        stdin_payload,
+        unix_time_ms(),
+        format!("hook-{}", unix_time_ms()),
+    );
+    let executed = execute_hook_runtime(&request)
+        .map_err(|error| format!("cannot execute hook payload: {error}"))?;
+    println!(
+        "hook events appended: {} path={}",
+        executed.captured.events.len(),
+        event_log.display()
+    );
+    Ok(())
+}
+
+fn command_proxy(args: &[String]) -> Result<(), String> {
+    let bind_host = value_after(args, "--bind-host").unwrap_or("127.0.0.1");
+    let bind_port = value_after(args, "--port")
+        .unwrap_or("17683")
+        .parse::<u16>()
+        .map_err(|error| format!("invalid --port: {error}"))?;
+    let upstream = value_after(args, "--upstream")
+        .ok_or_else(|| "--upstream is required for proxy".to_owned())?;
+    let config = ProxyConfig::new(bind_host, bind_port, upstream).map_err(|e| e.to_string())?;
+    println!(
+        "proxy listening on {}:{} -> {}",
+        config.bind_host, config.bind_port, config.upstream_url
+    );
+    run_proxy(config).map_err(|error| format!("proxy failed: {error}"))
 }
 
 fn default_init_request() -> Result<InitRequest, String> {
@@ -187,6 +286,12 @@ fn apply_init_plan(plan: &InitPlan, request: &InitRequest) -> Result<(), String>
                         .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
                 }
                 let content = match record.action {
+                    InstallAction::CreateFile
+                        if record.path.file_name().and_then(|name| name.to_str())
+                            == Some("claude-code-hook.json") =>
+                    {
+                        hook_file_content(&default_event_log_path()?)
+                    }
                     InstallAction::CreateFile => {
                         format!("created_by=vc-tokmeter\ndetail={}\n", record.detail)
                     }
@@ -256,6 +361,20 @@ fn default_event_log_path() -> Result<PathBuf, String> {
     Ok(current_dir()?.join(".tokmeter").join("events.jsonl"))
 }
 
+fn default_completed_runs_path() -> Result<PathBuf, String> {
+    Ok(completed_runs_path(
+        current_dir()?.join(".tokmeter").join("runs"),
+    ))
+}
+
+fn hook_file_content(event_log_path: &std::path::Path) -> String {
+    format!(
+        "{{\n  \"hooks\": [\n    {{\n      \"event\": \"PreToolUse\",\n      \"command\": \"vc-tokmeter hook --source claude-code --event PreToolUse --event-log {}\"\n    }},\n    {{\n      \"event\": \"PostToolUse\",\n      \"command\": \"vc-tokmeter hook --source claude-code --event PostToolUse --event-log {}\"\n    }}\n  ]\n}}\n",
+        event_log_path.display(),
+        event_log_path.display()
+    )
+}
+
 fn value_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.windows(2)
         .find(|window| window[0] == flag)
@@ -266,10 +385,25 @@ fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
 }
 
+fn split_wrapped_command(args: &[String]) -> (&[String], &[String]) {
+    args.iter()
+        .position(|arg| arg == "--")
+        .map(|index| (&args[..index], &args[index + 1..]))
+        .unwrap_or((args, &[]))
+}
+
 fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn unix_time_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
         .unwrap_or(1)
         .max(1)
 }

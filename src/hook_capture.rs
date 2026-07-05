@@ -1,3 +1,7 @@
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::PathBuf;
+
 use crate::classifier::{Classifier, Event};
 use crate::core::EventLog;
 use crate::core::{
@@ -84,6 +88,30 @@ pub struct ExecutedHookPayload {
     pub event_log_records: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookRuntimeRequest {
+    pub event_log_path: PathBuf,
+    pub stdin_payload: String,
+    pub timestamp_ms: u64,
+    pub run_id: String,
+}
+
+impl HookRuntimeRequest {
+    pub fn new(
+        event_log_path: impl Into<PathBuf>,
+        stdin_payload: impl Into<String>,
+        timestamp_ms: u64,
+        run_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            event_log_path: event_log_path.into(),
+            stdin_payload: stdin_payload.into(),
+            timestamp_ms,
+            run_id: run_id.into(),
+        }
+    }
+}
+
 pub fn capture_hook_payload(
     payload: &HookPayloadFields<'_>,
 ) -> Result<CapturedHookEvents, ValidationError> {
@@ -162,6 +190,31 @@ pub fn execute_hook_payload(
         captured,
         event_log_records,
     })
+}
+
+pub fn execute_hook_runtime(request: &HookRuntimeRequest) -> io::Result<ExecutedHookPayload> {
+    let parsed = ParsedHookRuntimePayload::parse(&request.stdin_payload);
+    let metadata = HookCaptureMetadata::passive(request.timestamp_ms, &request.run_id);
+    let fields = HookPayloadFields {
+        metadata,
+        tool_name: parsed.tool_name.as_deref().unwrap_or(UNKNOWN_TOOL),
+        command: parsed.command.as_deref(),
+        arguments: parsed.arguments.as_deref(),
+        result: parsed.result.as_deref(),
+        tokens: parsed.tokens,
+    };
+    let executed = execute_hook_payload(&fields).map_err(event_log_io_error)?;
+
+    if let Some(parent) = request.event_log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&request.event_log_path)?;
+    file.write_all(&executed.event_log_records)?;
+
+    Ok(executed)
 }
 
 pub fn hook_events_from_payload(
@@ -243,6 +296,93 @@ fn operation_class_from_classifier(value: &str) -> OperationClass {
         crate::classifier::EDIT_ECHO => OperationClass::EditEcho,
         _ => OperationClass::Other,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedHookRuntimePayload {
+    tool_name: Option<String>,
+    command: Option<String>,
+    arguments: Option<String>,
+    result: Option<String>,
+    tokens: TokenCounts,
+}
+
+impl ParsedHookRuntimePayload {
+    fn parse(payload: &str) -> Self {
+        Self {
+            tool_name: extract_json_string_any(payload, &["tool_name", "tool", "name"]),
+            command: extract_json_string_any(payload, &["command"]),
+            arguments: extract_json_string_any(payload, &["arguments", "input", "params"]),
+            result: extract_json_string_any(payload, &["result", "content", "tool_output"]),
+            tokens: TokenCounts::new(
+                extract_json_u64_any(payload, &["input_tokens", "prompt_tokens"]).unwrap_or(0),
+                extract_json_u64_any(payload, &["output_tokens", "completion_tokens"]).unwrap_or(0),
+                extract_json_u64_any(payload, &["cache_read_tokens"]).unwrap_or(0),
+                extract_json_u64_any(payload, &["cache_write_tokens"]).unwrap_or(0),
+            ),
+        }
+    }
+}
+
+fn extract_json_string_any(payload: &str, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| extract_json_string(payload, key))
+}
+
+fn extract_json_string(payload: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{key}\"");
+    let start = payload.find(&pattern)?;
+    let after_key = &payload[start + pattern.len()..];
+    let colon = after_key.find(':')?;
+    let mut chars = after_key[colon + 1..].trim_start().chars();
+    if chars.next()? != '"' {
+        return None;
+    }
+
+    let mut value = String::new();
+    let mut escaped = false;
+    for ch in chars {
+        if escaped {
+            value.push(match ch {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                '"' => '"',
+                '\\' => '\\',
+                other => other,
+            });
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Some(value);
+        } else {
+            value.push(ch);
+        }
+    }
+
+    None
+}
+
+fn extract_json_u64_any(payload: &str, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| extract_json_u64(payload, key))
+}
+
+fn extract_json_u64(payload: &str, key: &str) -> Option<u64> {
+    let pattern = format!("\"{key}\"");
+    let start = payload.find(&pattern)?;
+    let after_key = &payload[start + pattern.len()..];
+    let colon = after_key.find(':')?;
+    let digits = after_key[colon + 1..]
+        .trim_start()
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
+fn event_log_io_error(error: EventLogError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
 fn tokens_for_arguments(tokens: TokenCounts, has_result: bool) -> TokenCounts {

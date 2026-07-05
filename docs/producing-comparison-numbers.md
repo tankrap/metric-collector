@@ -30,9 +30,20 @@ cargo run -- run --profile treatment --task task-1
 cargo run -- run --next
 ```
 
-Full compare aggregation is still in progress. Until adapter event aggregation
-and compare reporting are wired end to end, Mode T output should be treated as
-run planning and capture metadata rather than a complete Grade P report.
+The report layer can now produce Grade P comparison artifacts from two local
+inputs:
+
+- the core `events.jsonl` event log
+- the versioned `completed-runs.tsv` run outcome store
+
+The compare report joins records by `run_id`, `task_id`, and `profile_id`.
+Token deltas use completed task records only. Failed and aborted records remain
+visible in the side-by-side completion-rate table so a cheaper treatment cannot
+hide lower task completion.
+
+The public report helper is ready for CLI wiring. The remaining command-line
+work is to expose a `report --compare --completed-runs <path>` style entry point
+from `src/main.rs`.
 
 Runs are grouped by profile:
 
@@ -80,5 +91,7 @@ generic. Do not include source snippets, stack traces, internal URLs, customer
 names, secrets, proprietary feature names, exact file paths, branch names, or
 private issue links.
 
-`vc-tokmeter report --share` is the planned artifact testers should be asked to
-send once share export lands. Sharing remains manual and explicit.
+`vc-tokmeter report --share` writes an explicit manual share artifact. For
+comparison reports, sharing should happen from the generated Grade P
+`report.json` and `report.md` so the same completion-rate warnings travel with
+the numbers.

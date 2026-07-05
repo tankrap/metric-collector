@@ -31,6 +31,11 @@ operation classes, completion rates, warning labels, salted path/repository
 hashes, and truncated digests. It must not include prompts, source snippets,
 raw tool output, provider credentials, or unhashed private paths.
 
+Grade P comparison shares use the same redaction path as passive reports. They
+may include baseline/treatment profile labels, completed-task token totals,
+tokens per completed task, and side-by-side completion rates. They must not add
+task prompts, done-condition text, local completion notes, or raw event payloads.
+
 Passive reports are Grade O evidence: observational workloads were not
 controlled, so differences may reflect changes in the work itself. Grade O
 artifacts can show descriptive deltas, but they must not present savings claims.

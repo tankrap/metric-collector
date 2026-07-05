@@ -43,6 +43,13 @@ Local completion notes are never written to this shared progress file. Keep
 private debugging context in local notes only, not in task titles or done
 conditions.
 
+The run wrapper API plans from the persisted store, executes a supplied command
+or session closure, accepts a completion decision, and appends the public record.
+The CLI integration should wire `tokmeter run --next -- <agent command...>` to
+`execute_wrapped_run(...)`, pass the real completion prompt decision, and use
+`completion_decision_from_command_outcome(...)` as the non-interactive default.
+Only `completed` records should be fed back into scheduler planning.
+
 ## Writing Done Conditions
 
 Write done conditions as observable outcomes, not implementation notes. Good

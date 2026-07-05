@@ -359,7 +359,7 @@ impl std::error::Error for ClaudeHookError {}
 
 fn tokmeter_hook_entry(settings: &TokmeterHookInstall, event: ClaudeHookEvent) -> ClaudeHookEntry {
     ClaudeHookEntry::command(format!(
-        "{} hook --source claude-code --event {} --install-id {} # {}",
+        "{} hook --source claude-code --event {} --install-id {} --event-log .tokmeter/events.jsonl # {}",
         settings.binary,
         event.as_str(),
         settings.install_id,

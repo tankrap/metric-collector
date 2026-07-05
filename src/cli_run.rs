@@ -1,10 +1,14 @@
 use std::error::Error;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use crate::completion::{CompletionRecord, CompletionStatus};
+use crate::completion::{
+    CompletionPromptDecision, CompletionRecord, CompletionStatus, CompletionValidationError,
+};
 use crate::mode::ModeState;
 use crate::run::{Profile as RunProfile, RunMetadata};
 use crate::scheduler::{
@@ -208,6 +212,123 @@ pub struct RunPlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunCommandOutcome {
+    pub succeeded: bool,
+    pub exit_code: Option<i32>,
+}
+
+impl RunCommandOutcome {
+    pub const fn success() -> Self {
+        Self {
+            succeeded: true,
+            exit_code: Some(0),
+        }
+    }
+
+    pub const fn failure(exit_code: Option<i32>) -> Self {
+        Self {
+            succeeded: false,
+            exit_code,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WrappedRunOptions {
+    pub completed_runs_path: PathBuf,
+    pub done_condition: String,
+    pub completion_fallback: CompletionStatus,
+    pub local_note: Option<String>,
+    pub ended_at_ms: u64,
+    pub completed_at_unix: u64,
+}
+
+impl WrappedRunOptions {
+    pub fn new(
+        completed_runs_path: impl Into<PathBuf>,
+        done_condition: impl Into<String>,
+        ended_at_ms: u64,
+        completed_at_unix: u64,
+    ) -> Self {
+        Self {
+            completed_runs_path: completed_runs_path.into(),
+            done_condition: done_condition.into(),
+            completion_fallback: CompletionStatus::Aborted,
+            local_note: None,
+            ended_at_ms,
+            completed_at_unix,
+        }
+    }
+
+    pub const fn with_completion_fallback(mut self, completion_fallback: CompletionStatus) -> Self {
+        self.completion_fallback = completion_fallback;
+        self
+    }
+
+    pub fn with_local_note(mut self, local_note: impl Into<String>) -> Self {
+        self.local_note = Some(local_note.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WrappedRunResult {
+    pub plan: RunPlan,
+    pub command: RunCommandOutcome,
+    pub completion_decision: CompletionPromptDecision,
+    pub completion: CompletionRecord,
+    pub stored_record: CompletedRunRecord,
+}
+
+#[derive(Debug)]
+pub enum WrappedRunError {
+    Plan(RunPlanError),
+    Store(CompletedRunStoreError),
+    Command(io::Error),
+    Completion(CompletionValidationError),
+}
+
+impl fmt::Display for WrappedRunError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Plan(error) => write!(formatter, "run planning failed: {error}"),
+            Self::Store(error) => write!(formatter, "completed run store update failed: {error}"),
+            Self::Command(error) => write!(formatter, "wrapped command failed to launch: {error}"),
+            Self::Completion(error) => write!(formatter, "completion record is invalid: {error}"),
+        }
+    }
+}
+
+impl Error for WrappedRunError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Plan(error) => Some(error),
+            Self::Store(error) => Some(error),
+            Self::Command(error) => Some(error),
+            Self::Completion(error) => Some(error),
+        }
+    }
+}
+
+impl From<RunPlanError> for WrappedRunError {
+    fn from(error: RunPlanError) -> Self {
+        Self::Plan(error)
+    }
+}
+
+impl From<CompletedRunStoreError> for WrappedRunError {
+    fn from(error: CompletedRunStoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl From<CompletionValidationError> for WrappedRunError {
+    fn from(error: CompletionValidationError) -> Self {
+        Self::Completion(error)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RunPlanError {
     MissingValue {
         flag: &'static str,
@@ -302,6 +423,42 @@ impl Error for CompletedRunStoreError {
             Self::Io(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+#[derive(Debug)]
+pub enum RunPlanFromStoreError {
+    Store(CompletedRunStoreError),
+    Plan(RunPlanError),
+}
+
+impl fmt::Display for RunPlanFromStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Store(error) => write!(formatter, "completed run store read failed: {error}"),
+            Self::Plan(error) => write!(formatter, "run planning failed: {error}"),
+        }
+    }
+}
+
+impl Error for RunPlanFromStoreError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Store(error) => Some(error),
+            Self::Plan(error) => Some(error),
+        }
+    }
+}
+
+impl From<CompletedRunStoreError> for RunPlanFromStoreError {
+    fn from(error: CompletedRunStoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl From<RunPlanError> for RunPlanFromStoreError {
+    fn from(error: RunPlanError) -> Self {
+        Self::Plan(error)
     }
 }
 
@@ -450,6 +607,91 @@ where
 {
     let args = parse_run_args(args)?;
     plan_from_parsed_args(&args, context)
+}
+
+pub fn plan_run_from_completed_store<I, S>(
+    args: I,
+    context: &RunPlanContext<'_>,
+    completed_runs_path: impl AsRef<Path>,
+) -> Result<RunPlan, RunPlanFromStoreError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let records = read_completed_run_records(completed_runs_path)?;
+    let completed_runs = completed_runs_for_scheduler(&records);
+    let context = context.clone().with_completed_runs(&completed_runs);
+    Ok(plan_run(args, &context)?)
+}
+
+pub fn execute_wrapped_run<I, S, C, D>(
+    args: I,
+    context: &RunPlanContext<'_>,
+    options: &WrappedRunOptions,
+    command: C,
+    completion_decision: D,
+) -> Result<WrappedRunResult, WrappedRunError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+    C: FnOnce(&RunPlan) -> io::Result<RunCommandOutcome>,
+    D: FnOnce(&RunPlan, &RunCommandOutcome) -> CompletionPromptDecision,
+{
+    let plan = match plan_run_from_completed_store(args, context, &options.completed_runs_path) {
+        Ok(plan) => plan,
+        Err(RunPlanFromStoreError::Store(error)) => return Err(WrappedRunError::Store(error)),
+        Err(RunPlanFromStoreError::Plan(error)) => return Err(WrappedRunError::Plan(error)),
+    };
+    let command = command(&plan).map_err(WrappedRunError::Command)?;
+    let completion_decision = completion_decision(&plan, &command);
+    let completion = CompletionRecord::new(
+        plan.run_metadata.run_id.to_string(),
+        plan.manifest_task_id.clone(),
+        options.done_condition.clone(),
+        completion_decision.status,
+        options.local_note.clone(),
+        options.completed_at_unix,
+    )?;
+    let stored_record =
+        completed_run_record_from_completion(&plan, &completion, options.ended_at_ms)?;
+
+    append_completed_run_record(&options.completed_runs_path, &stored_record)?;
+
+    Ok(WrappedRunResult {
+        plan,
+        command,
+        completion_decision,
+        completion,
+        stored_record,
+    })
+}
+
+pub fn execute_process_command<I, S>(
+    program: impl AsRef<OsStr>,
+    args: I,
+) -> io::Result<RunCommandOutcome>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    let status = Command::new(program)
+        .args(args.into_iter().map(Into::into))
+        .status()?;
+
+    Ok(RunCommandOutcome {
+        succeeded: status.success(),
+        exit_code: status.code(),
+    })
+}
+
+pub fn completion_decision_from_command_outcome(
+    command: &RunCommandOutcome,
+) -> CompletionPromptDecision {
+    if command.succeeded {
+        CompletionPromptDecision::from_status(CompletionStatus::Completed)
+    } else {
+        CompletionPromptDecision::from_status(CompletionStatus::Failed)
+    }
 }
 
 pub fn plan_from_parsed_args(
@@ -853,6 +1095,16 @@ mod tests {
         ))
     }
 
+    fn wrapped_options(path: PathBuf) -> WrappedRunOptions {
+        WrappedRunOptions::new(
+            path,
+            "Done when the observable test fixture passes.",
+            1_725_000_091_123,
+            1_725_000_092,
+        )
+        .with_local_note("PRIVATE local command output and debugging context")
+    }
+
     fn completed_record(task_id: &str, profile_id: &str, repetition: usize) -> CompletedRunRecord {
         CompletedRunRecord::new(
             format!("run-{task_id}-{profile_id}-{repetition}"),
@@ -1051,6 +1303,112 @@ mod tests {
         assert!(!serialized.contains("PRIVATE local debugging note"));
         assert!(!serialized.contains("local_note"));
         assert!(!serialized.contains("done_condition"));
+    }
+
+    #[test]
+    fn wrapped_successful_command_persists_completion_and_advances_next() {
+        let path = temp_store_path("wrapped-success");
+        let manifest = manifest();
+        let context = context(&manifest);
+        let options = wrapped_options(path.clone());
+
+        let result = execute_wrapped_run(
+            ["--next"],
+            &context,
+            &options,
+            |_plan| Ok(RunCommandOutcome::success()),
+            |_plan, command| completion_decision_from_command_outcome(command),
+        )
+        .unwrap();
+
+        assert_eq!(result.command, RunCommandOutcome::success());
+        assert_eq!(result.stored_record.status, CompletionStatus::Completed);
+        assert_eq!(result.stored_record.task_id, "task-1");
+        assert_eq!(result.stored_record.profile_id, "baseline");
+        assert_eq!(result.stored_record.repetition, 1);
+
+        let serialized = fs::read_to_string(&path).unwrap();
+        assert!(!serialized.contains("PRIVATE local command output"));
+        assert!(!serialized.contains("observable test fixture"));
+        assert!(!serialized.contains("done_condition"));
+        assert!(!serialized.contains("local_note"));
+
+        let next = plan_run_from_completed_store(["--next"], &context, &path).unwrap();
+        assert_eq!(next.manifest_task_id, "task-1");
+        assert_eq!(next.profile_id, "treatment");
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn wrapped_failed_command_persists_failed_status_without_advancing_next() {
+        let path = temp_store_path("wrapped-failed");
+        let manifest = manifest();
+        let context = context(&manifest);
+        let options = wrapped_options(path.clone());
+
+        let result = execute_wrapped_run(
+            ["--next"],
+            &context,
+            &options,
+            |_plan| Ok(RunCommandOutcome::failure(Some(2))),
+            |_plan, command| completion_decision_from_command_outcome(command),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.command,
+            RunCommandOutcome {
+                succeeded: false,
+                exit_code: Some(2),
+            }
+        );
+        assert_eq!(result.stored_record.status, CompletionStatus::Failed);
+
+        let next = plan_run_from_completed_store(["--next"], &context, &path).unwrap();
+        assert_eq!(next.manifest_task_id, "task-1");
+        assert_eq!(next.profile_id, "baseline");
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn wrapped_aborted_completion_persists_abort_without_advancing_next() {
+        let path = temp_store_path("wrapped-aborted");
+        let manifest = manifest();
+        let context = context(&manifest);
+        let options = wrapped_options(path.clone());
+
+        let result = execute_wrapped_run(
+            ["--next"],
+            &context,
+            &options,
+            |_plan| Ok(RunCommandOutcome::success()),
+            |_plan, _command| CompletionPromptDecision::from_status(CompletionStatus::Aborted),
+        )
+        .unwrap();
+
+        assert_eq!(result.command, RunCommandOutcome::success());
+        assert_eq!(result.stored_record.status, CompletionStatus::Aborted);
+
+        let records = read_completed_run_records(&path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(completed_runs_for_scheduler(&records), Vec::new());
+
+        let next = plan_run_from_completed_store(["--next"], &context, &path).unwrap();
+        assert_eq!(next.manifest_task_id, "task-1");
+        assert_eq!(next.profile_id, "baseline");
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn process_command_helper_reports_process_exit_status() {
+        let current_exe = std::env::current_exe().unwrap();
+        let outcome = execute_process_command(&current_exe, ["--help"]).unwrap();
+
+        assert!(outcome.succeeded);
+        assert_eq!(outcome.exit_code, Some(0));
     }
 
     #[test]

@@ -23,6 +23,29 @@ Prerequisites:
 - A local repository where the tester can run baseline and treatment tasks.
 - Claude Code hooks or local proxy wiring once the matching adapter is enabled.
 
+## Local Proxy Runtime Primitive
+
+The proxy runtime is intentionally localhost-only. `ProxyConfig::new` accepts
+`localhost`, `127.0.0.1`, or `::1` bind hosts and rejects wildcard or LAN
+addresses before binding.
+
+The current stdlib runtime primitive supports HTTP upstream forwarding for
+local/testable provider endpoints. It rewrites the request target to the
+configured upstream base path, forwards provider credentials to the upstream,
+relays the upstream response bytes to the client, and captures only sanitized
+metadata locally:
+
+- request method and query-redacted path;
+- sensitive headers with values replaced by `[REDACTED]`;
+- provider usage/cache token fields from the upstream response body;
+- attribution-compatible proxy events and core event-log JSONL records.
+
+Prompt bodies, response content, tool output text, query credential values, and
+provider credentials are not persisted in proxy capture records. Production CLI
+integration still needs a command/config path that starts the proxy, writes the
+captured core event records to `.tokmeter/events.jsonl`, and enables HTTPS
+provider forwarding through an adapter-specific transport.
+
 ## Static Binary
 
 Planned v1 install path:

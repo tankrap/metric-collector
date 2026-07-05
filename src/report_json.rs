@@ -79,6 +79,40 @@ impl CompletionRate {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CompareSummary<'a> {
+    pub baseline_profile_id: &'a str,
+    pub treatment_profile_id: &'a str,
+    pub rows: &'a [CompareRow<'a>],
+    pub completion_rates: CompletionRateComparison,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CompareRow<'a> {
+    pub metric: &'a str,
+    pub baseline: MetricValue,
+    pub treatment: MetricValue,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MetricValue {
+    pub value: f64,
+    pub median: Option<f64>,
+    pub iqr: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CompletionRateComparison {
+    pub tasks: CompletionRatePair,
+    pub runs: CompletionRatePair,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CompletionRatePair {
+    pub baseline: CompletionRate,
+    pub treatment: CompletionRate,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RepeatMetrics {
     pub repeat_event_count: u64,
     pub repeat_tokens: u64,
@@ -109,6 +143,7 @@ pub struct ReportJson<'a> {
     pub run_profile_totals: &'a [RunProfileTotals<'a>],
     pub class_shares: &'a [ClassShare<'a>],
     pub completion_rates: CompletionRates,
+    pub comparison: Option<CompareSummary<'a>>,
     pub repeat_metrics: RepeatMetrics,
     pub cache_metrics: CacheMetrics,
     pub calibration: CalibrationMetadata<'a>,
@@ -158,6 +193,9 @@ impl ReportJson<'_> {
         write_completion_rates(&mut out, &self.completion_rates);
         out.push_str(",\n");
 
+        write_comparison(&mut out, self.comparison);
+        out.push_str(",\n");
+
         write_repeat_metrics(&mut out, &self.repeat_metrics);
         out.push_str(",\n");
 
@@ -172,6 +210,117 @@ impl ReportJson<'_> {
         out.push_str("}\n");
         out
     }
+}
+
+fn write_comparison(out: &mut String, comparison: Option<CompareSummary<'_>>) {
+    write_field_name(out, 1, "comparison");
+    match comparison {
+        Some(comparison) => {
+            out.push_str("{\n");
+            write_str_field(
+                out,
+                2,
+                "baseline_profile_id",
+                comparison.baseline_profile_id,
+                true,
+            );
+            write_str_field(
+                out,
+                2,
+                "treatment_profile_id",
+                comparison.treatment_profile_id,
+                true,
+            );
+            write_compare_rows(out, comparison.rows);
+            out.push_str(",\n");
+            write_completion_rate_comparison(out, &comparison.completion_rates);
+            write_indent(out, 1);
+            out.push('}');
+        }
+        None => out.push_str("null"),
+    }
+}
+
+fn write_compare_rows(out: &mut String, rows: &[CompareRow<'_>]) {
+    write_field_name(out, 2, "rows");
+    out.push_str("[\n");
+    for (index, row) in rows.iter().enumerate() {
+        write_indent(out, 3);
+        out.push_str("{\n");
+        write_str_field(out, 4, "metric", row.metric, true);
+        write_metric_value(out, 4, "baseline", &row.baseline, true);
+        write_metric_value(out, 4, "treatment", &row.treatment, true);
+        write_f64_field(
+            out,
+            4,
+            "delta_baseline_minus_treatment",
+            row.baseline.value - row.treatment.value,
+            true,
+        );
+        write_optional_f64_field(
+            out,
+            4,
+            "delta_ratio",
+            ratio(row.baseline.value - row.treatment.value, row.baseline.value),
+            false,
+        );
+        write_indent(out, 3);
+        out.push('}');
+        if index + 1 != rows.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    write_indent(out, 2);
+    out.push(']');
+}
+
+fn write_metric_value(
+    out: &mut String,
+    indent: usize,
+    name: &str,
+    value: &MetricValue,
+    comma: bool,
+) {
+    write_field_name(out, indent, name);
+    out.push_str("{\n");
+    write_f64_field(out, indent + 1, "value", value.value, true);
+    write_optional_f64_field(out, indent + 1, "median", value.median, true);
+    write_optional_f64_field(out, indent + 1, "iqr", value.iqr, false);
+    write_indent(out, indent);
+    out.push('}');
+    if comma {
+        out.push(',');
+    }
+    out.push('\n');
+}
+
+fn write_completion_rate_comparison(out: &mut String, comparison: &CompletionRateComparison) {
+    write_field_name(out, 2, "completion_rates");
+    out.push_str("{\n");
+    write_completion_rate_pair(out, 3, "tasks", &comparison.tasks, true);
+    write_completion_rate_pair(out, 3, "runs", &comparison.runs, false);
+    write_indent(out, 2);
+    out.push_str("}\n");
+}
+
+fn write_completion_rate_pair(
+    out: &mut String,
+    indent: usize,
+    name: &str,
+    pair: &CompletionRatePair,
+    comma: bool,
+) {
+    write_field_name(out, indent, name);
+    out.push_str("{\n");
+    write_completion_rate(out, indent + 1, "baseline", &pair.baseline, true);
+    write_completion_rate(out, indent + 1, "treatment", &pair.treatment, false);
+    write_indent(out, indent);
+    out.push('}');
+    if comma {
+        out.push(',');
+    }
+    out.push('\n');
 }
 
 fn write_totals(out: &mut String, indent: usize, totals: &Totals) {
@@ -370,6 +519,14 @@ fn write_warnings(out: &mut String, warnings: &[&str]) {
     out.push(']');
 }
 
+fn ratio(part: f64, total: f64) -> Option<f64> {
+    if total == 0.0 || !part.is_finite() || !total.is_finite() {
+        None
+    } else {
+        Some(part / total)
+    }
+}
+
 fn write_u32_field(out: &mut String, indent: usize, name: &str, value: u32, comma: bool) {
     write_field_name(out, indent, name);
     out.push_str(&value.to_string());
@@ -565,6 +722,7 @@ mod tests {
                     rate: 0.5,
                 },
             },
+            comparison: None,
             repeat_metrics: RepeatMetrics {
                 repeat_event_count: 1,
                 repeat_tokens: 15,
@@ -615,6 +773,7 @@ mod tests {
             run_profile_totals: &run_profile_totals,
             class_shares: &class_shares,
             completion_rates: CompletionRates::default(),
+            comparison: None,
             repeat_metrics: RepeatMetrics {
                 repeat_event_count: 0,
                 repeat_tokens: 0,

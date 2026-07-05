@@ -3,6 +3,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::cli_run::{CompletedRunRecord, read_completed_run_records};
+use crate::completion::CompletionStatus as RunCompletionStatus;
 use crate::core::{AttributedTokenEvent, EventLog};
 use crate::report_json;
 use crate::report_markdown;
@@ -18,6 +20,9 @@ const FIRST_REPORT_WARNING: &str =
     "Passive self-report fixture: no event log was found; metrics are observational.";
 const EVENT_LOG_REPORT_WARNING: &str =
     "Event-log report: Grade O observational metrics; controlled efficiency claims require Mode T.";
+const COMPARE_REPORT_WARNING: &str = "Mode T compare report: token deltas use completed task runs only; review completion rates before interpreting the treatment.";
+const BASELINE_PROFILE_ID: &str = "baseline";
+const TREATMENT_PROFILE_ID: &str = "treatment";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CliReportPaths {
@@ -31,6 +36,7 @@ pub struct CliReportPaths {
 pub enum CliReportSource {
     PassiveSelfReportFixture,
     EventLogAggregation,
+    CompareAggregation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +101,37 @@ pub fn create_report_share_artifact(
         serialize_share_value(&sanitized),
     )?;
     Ok(artifacts.paths.report_share.clone())
+}
+
+pub fn create_compare_report_artifacts(
+    output_dir: impl AsRef<Path>,
+    event_log: impl AsRef<Path>,
+    completed_runs: impl AsRef<Path>,
+) -> io::Result<CliReportArtifacts> {
+    let log = EventLog::read_file(event_log.as_ref()).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to read event log: {error}"),
+        )
+    })?;
+    let completed_runs = read_completed_run_records(completed_runs.as_ref()).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to read completed runs: {error}"),
+        )
+    })?;
+    let compare =
+        CompareReportAggregate::from_events_and_completed_runs(&log.events, &completed_runs)?;
+
+    let paths = report_output_paths(output_dir);
+    fs::create_dir_all(&paths.output_dir)?;
+    fs::write(&paths.report_json, compare_report_json(&compare))?;
+    fs::write(&paths.report_markdown, compare_report_markdown(&compare))?;
+
+    Ok(CliReportArtifacts {
+        paths,
+        source: CliReportSource::CompareAggregation,
+    })
 }
 
 fn event_log_is_missing_or_empty(path: &Path) -> io::Result<bool> {
@@ -162,6 +199,7 @@ fn event_log_report_json(events: &[AttributedTokenEvent]) -> String {
         run_profile_totals: &run_profile_totals,
         class_shares: &class_shares,
         completion_rates: aggregate.completion_rates(),
+        comparison: None,
         repeat_metrics: aggregate.repeat_metrics(),
         cache_metrics: aggregate.cache_metrics(),
         calibration: report_json::CalibrationMetadata {
@@ -204,6 +242,97 @@ fn event_log_report_markdown(events: &[AttributedTokenEvent]) -> String {
     })
 }
 
+fn compare_report_json(compare: &CompareReportAggregate) -> String {
+    let run_profile_totals = compare
+        .run_profile_totals
+        .iter()
+        .map(|item| report_json::RunProfileTotals {
+            run_id: item.run_id.as_str(),
+            profile_id: item.profile_id.as_str(),
+            totals: item.totals,
+        })
+        .collect::<Vec<_>>();
+    let class_shares = compare
+        .class_totals
+        .iter()
+        .map(|(operation_class, tokens)| report_json::ClassShare {
+            operation_class: operation_class.as_str(),
+            tokens: *tokens,
+            share: ratio_or_zero(*tokens, compare.totals.total_tokens),
+        })
+        .collect::<Vec<_>>();
+    let rows = compare.comparison_rows();
+    let warnings = [COMPARE_REPORT_WARNING];
+
+    report_json::serialize_report_json(&report_json::ReportJson {
+        evidence_grade: report_json::EvidenceGrade::GradeP,
+        totals: compare.totals,
+        run_profile_totals: &run_profile_totals,
+        class_shares: &class_shares,
+        completion_rates: compare.completion_rates(),
+        comparison: Some(report_json::CompareSummary {
+            baseline_profile_id: BASELINE_PROFILE_ID,
+            treatment_profile_id: TREATMENT_PROFILE_ID,
+            rows: &rows,
+            completion_rates: compare.completion_comparison(),
+        }),
+        repeat_metrics: compare.repeat_metrics(),
+        cache_metrics: compare.cache_metrics(),
+        calibration: report_json::CalibrationMetadata {
+            source: Some("mode-t-event-log"),
+            tokenizer: Some("event-log"),
+            calibration_id: None,
+            sample_count: 0,
+            mean_absolute_error: None,
+        },
+        warnings: &warnings,
+    })
+}
+
+fn compare_report_markdown(compare: &CompareReportAggregate) -> String {
+    let json_rows = compare.comparison_rows();
+    let rows = json_rows
+        .iter()
+        .map(|row| report_markdown::CompareRow {
+            metric: row.metric,
+            baseline: report_markdown::MetricValue {
+                value: row.baseline.value,
+                median: row.baseline.median,
+                iqr: row.baseline.iqr,
+            },
+            treatment: report_markdown::MetricValue {
+                value: row.treatment.value,
+                median: row.treatment.median,
+                iqr: row.treatment.iqr,
+            },
+        })
+        .collect::<Vec<_>>();
+    let completion = compare.completion_comparison();
+    let warnings = [COMPARE_REPORT_WARNING];
+
+    report_markdown::serialize_report_markdown(&report_markdown::MarkdownReport {
+        title: "vc-tokmeter Mode T compare report",
+        evidence_grade: report_markdown::EvidenceGrade::GradeP,
+        single_profile: None,
+        comparison: Some(report_markdown::CompareSummary {
+            baseline_profile_id: BASELINE_PROFILE_ID,
+            treatment_profile_id: TREATMENT_PROFILE_ID,
+            rows: &rows,
+            completion_rates: report_markdown::CompletionRateComparison {
+                tasks: report_markdown::CompletionRatePair {
+                    baseline: completion_rate_to_markdown(completion.tasks.baseline),
+                    treatment: completion_rate_to_markdown(completion.tasks.treatment),
+                },
+                runs: report_markdown::CompletionRatePair {
+                    baseline: completion_rate_to_markdown(completion.runs.baseline),
+                    treatment: completion_rate_to_markdown(completion.runs.treatment),
+                },
+            },
+        }),
+        warnings: &warnings,
+    })
+}
+
 fn report_share_value(
     artifacts: &CliReportArtifacts,
     report_json: &str,
@@ -221,6 +350,7 @@ fn report_share_value(
             match artifacts.source {
                 CliReportSource::PassiveSelfReportFixture => "passive-self-report-fixture",
                 CliReportSource::EventLogAggregation => "event-log-aggregation",
+                CliReportSource::CompareAggregation => "compare-aggregation",
             }
             .to_owned(),
         ),
@@ -255,6 +385,311 @@ struct OwnedRunProfileTotals {
     run_id: String,
     profile_id: String,
     totals: report_json::Totals,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct CompareReportAggregate {
+    totals: report_json::Totals,
+    run_profile_totals: Vec<OwnedRunProfileTotals>,
+    class_totals: Vec<(String, u64)>,
+    completion: CompareCompletionAggregate,
+    completed_task_tokens: BTreeMap<String, Vec<u64>>,
+    repeat_event_count: u64,
+    repeat_tokens: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct CompareCompletionAggregate {
+    task_counts: BTreeMap<String, report_json::CompletionRate>,
+    run_counts: BTreeMap<String, report_json::CompletionRate>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetricMode {
+    Total,
+    Average,
+}
+
+impl CompareReportAggregate {
+    fn from_events_and_completed_runs(
+        events: &[AttributedTokenEvent],
+        completed_runs: &[CompletedRunRecord],
+    ) -> io::Result<Self> {
+        let completion = CompareCompletionAggregate::from_completed_runs(completed_runs);
+        if !completion.has_profile(BASELINE_PROFILE_ID)
+            || !completion.has_profile(TREATMENT_PROFILE_ID)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Grade P compare reports require baseline and treatment completed-run records",
+            ));
+        }
+
+        let mut run_ids = BTreeSet::new();
+        let mut task_ids = BTreeSet::new();
+        let mut run_profile_totals = BTreeMap::<(String, String), report_json::Totals>::new();
+        let mut run_profile_task_ids = BTreeMap::<(String, String), BTreeSet<String>>::new();
+        let mut class_totals = BTreeMap::<String, u64>::new();
+        let mut totals = report_json::Totals::default();
+        let mut repeat_event_count = 0u64;
+        let mut repeat_tokens = 0u64;
+        let completed_keys = completed_runs
+            .iter()
+            .filter(|record| record.status == RunCompletionStatus::Completed)
+            .map(|record| {
+                (
+                    record.run_id.as_str(),
+                    record.task_id.as_str(),
+                    record.profile_id.as_str(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let mut completed_token_totals = BTreeMap::<(String, String, String), u64>::new();
+
+        for event in events {
+            if !is_compare_profile(&event.profile_id) {
+                continue;
+            }
+            let total_tokens = event.tokens.total().unwrap_or(u64::MAX);
+            totals.event_count = totals.event_count.saturating_add(1);
+            totals.input_tokens = totals
+                .input_tokens
+                .saturating_add(event.tokens.input_tokens);
+            totals.output_tokens = totals
+                .output_tokens
+                .saturating_add(event.tokens.output_tokens);
+            totals.cache_read_tokens = totals
+                .cache_read_tokens
+                .saturating_add(event.tokens.cache_read_tokens);
+            totals.cache_write_tokens = totals
+                .cache_write_tokens
+                .saturating_add(event.tokens.cache_write_tokens);
+            totals.total_tokens = totals.total_tokens.saturating_add(total_tokens);
+            totals.byte_count = totals.byte_count.saturating_add(event.byte_count);
+
+            run_ids.insert(event.run_id.clone());
+            task_ids.insert(event.task_id.clone());
+            add_to_totals(
+                run_profile_totals
+                    .entry((event.run_id.clone(), event.profile_id.clone()))
+                    .or_default(),
+                event,
+                total_tokens,
+            );
+            run_profile_task_ids
+                .entry((event.run_id.clone(), event.profile_id.clone()))
+                .or_default()
+                .insert(event.task_id.clone());
+            *class_totals
+                .entry(event.operation_class.as_str().to_owned())
+                .or_insert(0) += total_tokens;
+
+            if event.repeat_of.is_some() {
+                repeat_event_count = repeat_event_count.saturating_add(1);
+                repeat_tokens = repeat_tokens.saturating_add(total_tokens);
+            }
+
+            if completed_keys.contains(&(
+                event.run_id.as_str(),
+                event.task_id.as_str(),
+                event.profile_id.as_str(),
+            )) {
+                *completed_token_totals
+                    .entry((
+                        event.run_id.clone(),
+                        event.task_id.clone(),
+                        event.profile_id.clone(),
+                    ))
+                    .or_insert(0) += total_tokens;
+            }
+        }
+
+        totals.run_count = run_ids.len() as u64;
+        totals.task_count = task_ids.len() as u64;
+        for (key, task_ids) in run_profile_task_ids {
+            if let Some(totals) = run_profile_totals.get_mut(&key) {
+                totals.task_count = task_ids.len() as u64;
+            }
+        }
+
+        let mut completed_task_tokens = BTreeMap::<String, Vec<u64>>::new();
+        for record in completed_runs
+            .iter()
+            .filter(|record| record.status == RunCompletionStatus::Completed)
+            .filter(|record| is_compare_profile(&record.profile_id))
+        {
+            let tokens = completed_token_totals
+                .get(&(
+                    record.run_id.clone(),
+                    record.task_id.clone(),
+                    record.profile_id.clone(),
+                ))
+                .copied()
+                .unwrap_or(0);
+            completed_task_tokens
+                .entry(record.profile_id.clone())
+                .or_default()
+                .push(tokens);
+        }
+
+        Ok(Self {
+            totals,
+            run_profile_totals: run_profile_totals
+                .into_iter()
+                .map(|((run_id, profile_id), totals)| OwnedRunProfileTotals {
+                    run_id,
+                    profile_id,
+                    totals,
+                })
+                .collect(),
+            class_totals: class_totals.into_iter().collect(),
+            completion,
+            completed_task_tokens,
+            repeat_event_count,
+            repeat_tokens,
+        })
+    }
+
+    fn comparison_rows(&self) -> Vec<report_json::CompareRow<'static>> {
+        vec![
+            report_json::CompareRow {
+                metric: "Completed task tokens",
+                baseline: self.completed_task_metric(BASELINE_PROFILE_ID, MetricMode::Total),
+                treatment: self.completed_task_metric(TREATMENT_PROFILE_ID, MetricMode::Total),
+            },
+            report_json::CompareRow {
+                metric: "Tokens per completed task",
+                baseline: self.completed_task_metric(BASELINE_PROFILE_ID, MetricMode::Average),
+                treatment: self.completed_task_metric(TREATMENT_PROFILE_ID, MetricMode::Average),
+            },
+        ]
+    }
+
+    fn completed_task_metric(
+        &self,
+        profile_id: &str,
+        mode: MetricMode,
+    ) -> report_json::MetricValue {
+        let tokens = self
+            .completed_task_tokens
+            .get(profile_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let total = tokens.iter().copied().sum::<u64>() as f64;
+        let value = match mode {
+            MetricMode::Total => total,
+            MetricMode::Average => {
+                if tokens.is_empty() {
+                    0.0
+                } else {
+                    total / tokens.len() as f64
+                }
+            }
+        };
+        let samples = tokens.iter().map(|value| *value as f64).collect::<Vec<_>>();
+        report_json::MetricValue {
+            value,
+            median: median(&samples),
+            iqr: iqr(&samples),
+        }
+    }
+
+    fn completion_rates(&self) -> report_json::CompletionRates {
+        report_json::CompletionRates {
+            tasks: combine_rates(self.completion.task_counts.values().copied()),
+            runs: combine_rates(self.completion.run_counts.values().copied()),
+        }
+    }
+
+    fn repeat_metrics(&self) -> report_json::RepeatMetrics {
+        report_json::RepeatMetrics {
+            repeat_event_count: self.repeat_event_count,
+            repeat_tokens: self.repeat_tokens,
+            repeat_token_share: ratio_or_zero(self.repeat_tokens, self.totals.total_tokens),
+        }
+    }
+
+    fn cache_metrics(&self) -> report_json::CacheMetrics {
+        let cache_tokens = self
+            .totals
+            .cache_read_tokens
+            .saturating_add(self.totals.cache_write_tokens);
+
+        report_json::CacheMetrics {
+            cache_read_tokens: self.totals.cache_read_tokens,
+            cache_write_tokens: self.totals.cache_write_tokens,
+            cache_tokens,
+            cache_token_share: ratio_or_zero(cache_tokens, self.totals.total_tokens),
+        }
+    }
+
+    fn completion_comparison(&self) -> report_json::CompletionRateComparison {
+        report_json::CompletionRateComparison {
+            tasks: report_json::CompletionRatePair {
+                baseline: self.completion.rate_for_task_profile(BASELINE_PROFILE_ID),
+                treatment: self.completion.rate_for_task_profile(TREATMENT_PROFILE_ID),
+            },
+            runs: report_json::CompletionRatePair {
+                baseline: self.completion.rate_for_run_profile(BASELINE_PROFILE_ID),
+                treatment: self.completion.rate_for_run_profile(TREATMENT_PROFILE_ID),
+            },
+        }
+    }
+}
+
+impl CompareCompletionAggregate {
+    fn from_completed_runs(records: &[CompletedRunRecord]) -> Self {
+        let mut task_counts = BTreeMap::<String, report_json::CompletionRate>::new();
+        let mut run_statuses = BTreeMap::<(String, String), RunCompletionStatus>::new();
+
+        for record in records
+            .iter()
+            .filter(|record| is_compare_profile(&record.profile_id))
+        {
+            add_run_completion_count(
+                task_counts.entry(record.profile_id.clone()).or_default(),
+                record.status,
+            );
+            run_statuses
+                .entry((record.profile_id.clone(), record.run_id.clone()))
+                .and_modify(|status| *status = merge_run_completion_status(*status, record.status))
+                .or_insert(record.status);
+        }
+
+        for rate in task_counts.values_mut() {
+            rate.rate = completion_ratio(*rate);
+        }
+
+        let mut run_counts = BTreeMap::<String, report_json::CompletionRate>::new();
+        for ((profile_id, _run_id), status) in run_statuses {
+            add_run_completion_count(run_counts.entry(profile_id).or_default(), status);
+        }
+        for rate in run_counts.values_mut() {
+            rate.rate = completion_ratio(*rate);
+        }
+
+        Self {
+            task_counts,
+            run_counts,
+        }
+    }
+
+    fn has_profile(&self, profile_id: &str) -> bool {
+        self.task_counts
+            .get(profile_id)
+            .is_some_and(|rate| rate.total() > 0)
+    }
+
+    fn rate_for_task_profile(&self, profile_id: &str) -> report_json::CompletionRate {
+        self.task_counts
+            .get(profile_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn rate_for_run_profile(&self, profile_id: &str) -> report_json::CompletionRate {
+        self.run_counts.get(profile_id).copied().unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -442,6 +877,104 @@ fn ratio_or_zero(part: u64, total: u64) -> f64 {
     }
 }
 
+fn is_compare_profile(profile_id: &str) -> bool {
+    profile_id == BASELINE_PROFILE_ID || profile_id == TREATMENT_PROFILE_ID
+}
+
+fn add_run_completion_count(counts: &mut report_json::CompletionRate, status: RunCompletionStatus) {
+    match status {
+        RunCompletionStatus::Completed => counts.completed = counts.completed.saturating_add(1),
+        RunCompletionStatus::Failed => counts.failed = counts.failed.saturating_add(1),
+        RunCompletionStatus::Aborted => counts.incomplete = counts.incomplete.saturating_add(1),
+    }
+    counts.rate = completion_ratio(*counts);
+}
+
+fn merge_run_completion_status(
+    current: RunCompletionStatus,
+    next: RunCompletionStatus,
+) -> RunCompletionStatus {
+    match (current, next) {
+        (RunCompletionStatus::Failed, _) | (_, RunCompletionStatus::Failed) => {
+            RunCompletionStatus::Failed
+        }
+        (RunCompletionStatus::Aborted, _) | (_, RunCompletionStatus::Aborted) => {
+            RunCompletionStatus::Aborted
+        }
+        (RunCompletionStatus::Completed, RunCompletionStatus::Completed) => {
+            RunCompletionStatus::Completed
+        }
+    }
+}
+
+fn combine_rates(
+    rates: impl IntoIterator<Item = report_json::CompletionRate>,
+) -> report_json::CompletionRate {
+    let mut combined = report_json::CompletionRate::default();
+    for rate in rates {
+        combined.completed = combined.completed.saturating_add(rate.completed);
+        combined.failed = combined.failed.saturating_add(rate.failed);
+        combined.incomplete = combined.incomplete.saturating_add(rate.incomplete);
+    }
+    combined.rate = completion_ratio(combined);
+    combined
+}
+
+fn completion_ratio(rate: report_json::CompletionRate) -> f64 {
+    if rate.total() == 0 {
+        0.0
+    } else {
+        rate.completed as f64 / rate.total() as f64
+    }
+}
+
+fn median(values: &[f64]) -> Option<f64> {
+    let values = sorted_finite_values(values);
+    if values.is_empty() {
+        None
+    } else {
+        Some(median_of_sorted_slice(&values))
+    }
+}
+
+fn iqr(values: &[f64]) -> Option<f64> {
+    let values = sorted_finite_values(values);
+    if values.len() < 2 {
+        return None;
+    }
+    let midpoint = values.len() / 2;
+    let lower = &values[..midpoint];
+    let upper = if values.len() % 2 == 0 {
+        &values[midpoint..]
+    } else {
+        &values[midpoint + 1..]
+    };
+    if lower.is_empty() || upper.is_empty() {
+        None
+    } else {
+        Some(median_of_sorted_slice(upper) - median_of_sorted_slice(lower))
+    }
+}
+
+fn sorted_finite_values(values: &[f64]) -> Vec<f64> {
+    let mut values = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    values.sort_by(|left, right| left.total_cmp(right));
+    values
+}
+
+fn median_of_sorted_slice(values: &[f64]) -> f64 {
+    let midpoint = values.len() / 2;
+    if values.len() % 2 == 0 {
+        (values[midpoint - 1] + values[midpoint]) / 2.0
+    } else {
+        values[midpoint]
+    }
+}
+
 fn passive_self_report_json() -> String {
     let totals = passive_totals();
     let run_profile_totals = [report_json::RunProfileTotals {
@@ -482,6 +1015,7 @@ fn passive_self_report_json() -> String {
                 rate: 0.0,
             },
         },
+        comparison: None,
         repeat_metrics: report_json::RepeatMetrics::default(),
         cache_metrics: report_json::CacheMetrics {
             cache_read_tokens: totals.cache_read_tokens,
@@ -551,6 +1085,8 @@ fn passive_totals() -> report_json::Totals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli_run::{CompletedRunRecord, write_completed_run_records};
+    use crate::completion::CompletionStatus;
     use crate::core::{CaptureMode, OperationClass, TokenCounts};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -662,6 +1198,285 @@ mod tests {
     }
 
     #[test]
+    fn creates_grade_p_compare_artifacts_when_baseline_and_treatment_exist() {
+        let output_dir = temp_output_dir("compare-report");
+        fs::create_dir_all(&output_dir).unwrap();
+        let event_log = output_dir.join("events.jsonl");
+        let completed_runs = output_dir.join("completed-runs.tsv");
+        write_event_log(
+            &event_log,
+            &[
+                event(
+                    "baseline-ok",
+                    "task-1",
+                    "baseline",
+                    OperationClass::VcStatus,
+                    TokenCounts::new(100, 0, 0, 0),
+                    64,
+                    None,
+                ),
+                event(
+                    "baseline-fail",
+                    "task-2",
+                    "baseline",
+                    OperationClass::VcDiff,
+                    TokenCounts::new(900, 0, 0, 0),
+                    128,
+                    None,
+                ),
+                event(
+                    "treatment-ok",
+                    "task-1",
+                    "treatment",
+                    OperationClass::VcStatus,
+                    TokenCounts::new(70, 0, 0, 0),
+                    64,
+                    None,
+                ),
+                event(
+                    "treatment-abort",
+                    "task-2",
+                    "treatment",
+                    OperationClass::VcDiff,
+                    TokenCounts::new(100, 0, 0, 0),
+                    128,
+                    None,
+                ),
+            ],
+        );
+        write_completed_run_records(
+            &completed_runs,
+            &[
+                completed_record(
+                    "baseline-ok",
+                    "task-1",
+                    "baseline",
+                    CompletionStatus::Completed,
+                ),
+                completed_record(
+                    "baseline-fail",
+                    "task-2",
+                    "baseline",
+                    CompletionStatus::Failed,
+                ),
+                completed_record(
+                    "treatment-ok",
+                    "task-1",
+                    "treatment",
+                    CompletionStatus::Completed,
+                ),
+                completed_record(
+                    "treatment-abort",
+                    "task-2",
+                    "treatment",
+                    CompletionStatus::Aborted,
+                ),
+            ],
+        )
+        .unwrap();
+
+        let artifacts =
+            create_compare_report_artifacts(&output_dir, &event_log, &completed_runs).unwrap();
+
+        assert_eq!(artifacts.source, CliReportSource::CompareAggregation);
+        let json = fs::read_to_string(&artifacts.paths.report_json).unwrap();
+        let markdown = fs::read_to_string(&artifacts.paths.report_markdown).unwrap();
+        assert!(json.contains("\"evidence_grade\": \"Grade P\""));
+        assert!(json.contains("\"comparison\": {"));
+        assert!(json.contains("\"baseline_profile_id\": \"baseline\""));
+        assert!(json.contains("\"treatment_profile_id\": \"treatment\""));
+        assert!(json.contains("\"metric\": \"Tokens per completed task\""));
+        assert!(markdown.contains("# vc-tokmeter Mode T compare report"));
+        assert!(markdown.contains("**Evidence:** Grade P"));
+        assert!(markdown.contains("Baseline: **baseline**"));
+        assert!(markdown.contains("Treatment: **treatment**"));
+    }
+
+    #[test]
+    fn compare_report_uses_completed_runs_only_for_token_math() {
+        let events = [
+            event(
+                "baseline-ok",
+                "task-1",
+                "baseline",
+                OperationClass::VcStatus,
+                TokenCounts::new(100, 0, 0, 0),
+                64,
+                None,
+            ),
+            event(
+                "baseline-fail",
+                "task-2",
+                "baseline",
+                OperationClass::VcDiff,
+                TokenCounts::new(900, 0, 0, 0),
+                128,
+                None,
+            ),
+            event(
+                "treatment-ok",
+                "task-1",
+                "treatment",
+                OperationClass::VcStatus,
+                TokenCounts::new(70, 0, 0, 0),
+                64,
+                None,
+            ),
+        ];
+        let completed_runs = [
+            completed_record(
+                "baseline-ok",
+                "task-1",
+                "baseline",
+                CompletionStatus::Completed,
+            ),
+            completed_record(
+                "baseline-fail",
+                "task-2",
+                "baseline",
+                CompletionStatus::Failed,
+            ),
+            completed_record(
+                "treatment-ok",
+                "task-1",
+                "treatment",
+                CompletionStatus::Completed,
+            ),
+        ];
+
+        let aggregate =
+            CompareReportAggregate::from_events_and_completed_runs(&events, &completed_runs)
+                .unwrap();
+        let rows = aggregate.comparison_rows();
+
+        assert_eq!(rows[0].metric, "Completed task tokens");
+        assert_eq!(rows[0].baseline.value, 100.0);
+        assert_eq!(rows[0].treatment.value, 70.0);
+        assert_eq!(rows[1].metric, "Tokens per completed task");
+        assert_eq!(rows[1].baseline.value, 100.0);
+        assert_eq!(rows[1].treatment.value, 70.0);
+        assert_eq!(aggregate.totals.total_tokens, 1_070);
+    }
+
+    #[test]
+    fn compare_report_shows_side_by_side_completion_rates() {
+        let output_dir = temp_output_dir("compare-completion-rates");
+        fs::create_dir_all(&output_dir).unwrap();
+        let event_log = output_dir.join("events.jsonl");
+        let completed_runs = output_dir.join("completed-runs.tsv");
+        write_event_log(
+            &event_log,
+            &[
+                event(
+                    "baseline-ok",
+                    "task-1",
+                    "baseline",
+                    OperationClass::VcStatus,
+                    TokenCounts::new(100, 0, 0, 0),
+                    64,
+                    None,
+                ),
+                event(
+                    "treatment-ok",
+                    "task-1",
+                    "treatment",
+                    OperationClass::VcStatus,
+                    TokenCounts::new(70, 0, 0, 0),
+                    64,
+                    None,
+                ),
+            ],
+        );
+        write_completed_run_records(
+            &completed_runs,
+            &[
+                completed_record(
+                    "baseline-ok",
+                    "task-1",
+                    "baseline",
+                    CompletionStatus::Completed,
+                ),
+                completed_record(
+                    "baseline-fail",
+                    "task-2",
+                    "baseline",
+                    CompletionStatus::Failed,
+                ),
+                completed_record(
+                    "treatment-ok",
+                    "task-1",
+                    "treatment",
+                    CompletionStatus::Completed,
+                ),
+                completed_record(
+                    "treatment-abort",
+                    "task-2",
+                    "treatment",
+                    CompletionStatus::Aborted,
+                ),
+            ],
+        )
+        .unwrap();
+
+        let artifacts =
+            create_compare_report_artifacts(&output_dir, &event_log, &completed_runs).unwrap();
+        let markdown = fs::read_to_string(&artifacts.paths.report_markdown).unwrap();
+
+        assert!(markdown.contains("## Completion rate changes"));
+        assert!(markdown.contains("| Tasks | 50.0% (1/2) | 50.0% (1/2) | 0.0 pp |"));
+        assert!(markdown.contains("| Runs | 50.0% (1/2) | 50.0% (1/2) | 0.0 pp |"));
+    }
+
+    #[test]
+    fn compare_report_does_not_use_observational_delta_language() {
+        let events = [
+            event(
+                "baseline-ok",
+                "task-1",
+                "baseline",
+                OperationClass::VcStatus,
+                TokenCounts::new(100, 0, 0, 0),
+                64,
+                None,
+            ),
+            event(
+                "treatment-ok",
+                "task-1",
+                "treatment",
+                OperationClass::VcStatus,
+                TokenCounts::new(70, 0, 0, 0),
+                64,
+                None,
+            ),
+        ];
+        let completed_runs = [
+            completed_record(
+                "baseline-ok",
+                "task-1",
+                "baseline",
+                CompletionStatus::Completed,
+            ),
+            completed_record(
+                "treatment-ok",
+                "task-1",
+                "treatment",
+                CompletionStatus::Completed,
+            ),
+        ];
+
+        let aggregate =
+            CompareReportAggregate::from_events_and_completed_runs(&events, &completed_runs)
+                .unwrap();
+        let markdown = compare_report_markdown(&aggregate);
+
+        assert!(
+            markdown.contains("| Tokens per completed task | Grade P | 100 | 70 | 30 (30.0%) |")
+        );
+        assert!(!markdown.contains("descriptive delta only"));
+        assert_no_savings_claim(&markdown);
+    }
+
+    #[test]
     fn share_artifact_redacts_report_paths_repo_names_and_raw_text() {
         let output_dir = temp_output_dir("private-metric-collector");
         let artifacts = create_first_report_artifacts(&output_dir, Option::<&Path>::None).unwrap();
@@ -733,6 +1548,26 @@ mod tests {
         .write_to(&mut bytes)
         .unwrap();
         fs::write(path, bytes).unwrap();
+    }
+
+    fn completed_record(
+        run_id: &str,
+        task_id: &str,
+        profile_id: &str,
+        status: CompletionStatus,
+    ) -> CompletedRunRecord {
+        CompletedRunRecord::new(
+            run_id,
+            task_id,
+            profile_id,
+            1,
+            status,
+            "test-adapter",
+            1_725_000_000_000,
+            Some(1_725_000_001_000),
+            1_725_000_001,
+        )
+        .unwrap()
     }
 
     fn event(

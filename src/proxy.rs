@@ -1,7 +1,10 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::core::{AttributedTokenEvent, EventLog, EventLogError, OperationClass, TokenCounts};
+use crate::digest::digest_bytes;
 use crate::mode::ModeState;
 use crate::proxy_attribution::{AttributionEvent, attribute_proxy_json_with_mode};
 use crate::proxy_privacy::{
@@ -69,12 +72,20 @@ pub struct ProxyCapture {
     pub redacted_headers: Vec<(String, String)>,
     pub usage: ProviderUsage,
     pub events: Vec<AttributionEvent>,
+    pub core_events: Vec<AttributedTokenEvent>,
+    pub event_log_records: Vec<u8>,
     pub persisted_log_line: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyRuntimeError {
     InvalidRequestLine,
+    InvalidUpstreamUrl { upstream_url: String },
+    UnsupportedUpstreamScheme { scheme: String },
+    MissingUpstreamHost { upstream_url: String },
+    InvalidUpstreamPort { port: String },
+    Io { message: String },
+    EventLog { message: String },
 }
 
 impl fmt::Display for ProxyRuntimeError {
@@ -83,11 +94,53 @@ impl fmt::Display for ProxyRuntimeError {
             Self::InvalidRequestLine => {
                 f.write_str("proxy request must start with an HTTP request line")
             }
+            Self::InvalidUpstreamUrl { upstream_url } => {
+                write!(f, "proxy upstream URL is invalid: {upstream_url:?}")
+            }
+            Self::UnsupportedUpstreamScheme { scheme } => write!(
+                f,
+                "proxy upstream scheme must be http for the stdlib runtime primitive; got {scheme:?}"
+            ),
+            Self::MissingUpstreamHost { upstream_url } => {
+                write!(
+                    f,
+                    "proxy upstream URL must include a host: {upstream_url:?}"
+                )
+            }
+            Self::InvalidUpstreamPort { port } => {
+                write!(f, "proxy upstream URL port is invalid: {port:?}")
+            }
+            Self::Io { message } => write!(f, "proxy upstream I/O failed: {message}"),
+            Self::EventLog { message } => {
+                write!(f, "proxy event log serialization failed: {message}")
+            }
         }
     }
 }
 
 impl std::error::Error for ProxyRuntimeError {}
+
+impl From<EventLogError> for ProxyRuntimeError {
+    fn from(error: EventLogError) -> Self {
+        Self::EventLog {
+            message: redact_provider_error(&error.to_string()),
+        }
+    }
+}
+
+impl From<io::Error> for ProxyRuntimeError {
+    fn from(error: io::Error) -> Self {
+        Self::Io {
+            message: redact_provider_error(&error.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyForwardedExchange {
+    pub response_bytes: Vec<u8>,
+    pub capture: ProxyCapture,
+}
 
 pub fn process_proxy_exchange(
     raw_request: &str,
@@ -107,6 +160,9 @@ pub fn process_proxy_exchange_with_mode(
     let usage = extract_provider_usage(provider_response_json);
     let redacted_response = redact_provider_error(provider_response_json);
     let events = attribute_proxy_json_with_mode(&request.body, &redacted_response, mode_state);
+    let core_events =
+        core_events_from_proxy_events(&events, usage, current_timestamp_ms(), "proxy");
+    let event_log_records = render_core_event_log_records(&core_events)?;
     let persisted_log_line =
         render_persisted_log_line(&request.method, &path, &redacted_headers, usage, &events);
 
@@ -116,6 +172,8 @@ pub fn process_proxy_exchange_with_mode(
         redacted_headers,
         usage,
         events,
+        core_events,
+        event_log_records,
         persisted_log_line,
     })
 }
@@ -164,7 +222,7 @@ pub fn run_proxy(config: ProxyConfig) -> io::Result<()> {
     let listener = TcpListener::bind((config.bind_host.as_str(), config.bind_port))?;
 
     for stream in listener.incoming() {
-        serve_proxy_connection(stream?)?;
+        serve_proxy_connection(stream?, &config)?;
     }
 
     Ok(())
@@ -174,26 +232,36 @@ fn is_allowed_localhost(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
-fn serve_proxy_connection(mut stream: TcpStream) -> io::Result<()> {
-    let request = read_http_like_request(&mut stream)?;
-    let response_body = match parse_http_request(&request) {
-        Ok(parsed) => format!(
-            "{{\"status\":\"accepted\",\"method\":\"{}\",\"path\":\"{}\"}}\n",
-            escape_json_string(&parsed.method),
-            escape_json_string(&sanitize_request_path(&parsed.path))
-        ),
-        Err(error) => format!(
-            "{{\"status\":\"bad_request\",\"error\":\"{}\"}}\n",
-            escape_json_string(&error.to_string())
-        ),
-    };
+pub fn forward_proxy_request(
+    config: &ProxyConfig,
+    raw_request: &str,
+) -> Result<ProxyForwardedExchange, ProxyRuntimeError> {
+    forward_proxy_request_with_mode(config, raw_request, &ModeState::passive())
+}
 
-    write!(
-        stream,
-        "HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-        response_body.len(),
-        response_body
-    )
+pub fn forward_proxy_request_with_mode(
+    config: &ProxyConfig,
+    raw_request: &str,
+    mode_state: &ModeState,
+) -> Result<ProxyForwardedExchange, ProxyRuntimeError> {
+    let upstream = ParsedUpstream::parse(&config.upstream_url)?;
+    let upstream_request = build_upstream_request(raw_request, &upstream)?;
+    let response_bytes = send_upstream_request(&upstream, &upstream_request)?;
+    let response_body = response_body_string(&response_bytes);
+    let capture = process_proxy_exchange_with_mode(raw_request, &response_body, mode_state)?;
+
+    Ok(ProxyForwardedExchange {
+        response_bytes,
+        capture,
+    })
+}
+
+fn serve_proxy_connection(mut stream: TcpStream, config: &ProxyConfig) -> io::Result<()> {
+    let request = read_http_like_request(&mut stream)?;
+    match forward_proxy_request(config, &request) {
+        Ok(exchange) => stream.write_all(&exchange.response_bytes),
+        Err(error) => write_proxy_error_response(&mut stream, error),
+    }
 }
 
 fn read_http_like_request(stream: &mut impl Read) -> io::Result<String> {
@@ -247,6 +315,325 @@ fn content_length(header_text: &str) -> Option<usize> {
             .then(|| value.trim().parse().ok())
             .flatten()
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedUpstream {
+    host: String,
+    port: u16,
+    base_path: String,
+    host_header: String,
+}
+
+impl ParsedUpstream {
+    fn parse(upstream_url: &str) -> Result<Self, ProxyRuntimeError> {
+        let Some((scheme, rest)) = upstream_url.split_once("://") else {
+            return Err(ProxyRuntimeError::InvalidUpstreamUrl {
+                upstream_url: upstream_url.to_owned(),
+            });
+        };
+
+        if scheme != "http" {
+            return Err(ProxyRuntimeError::UnsupportedUpstreamScheme {
+                scheme: scheme.to_owned(),
+            });
+        }
+
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        if authority.is_empty() {
+            return Err(ProxyRuntimeError::MissingUpstreamHost {
+                upstream_url: upstream_url.to_owned(),
+            });
+        }
+
+        let (host, port) = parse_authority(authority)?;
+        let host_header = if port == 80 {
+            host.clone()
+        } else {
+            format!("{host}:{port}")
+        };
+
+        Ok(Self {
+            host,
+            port,
+            base_path: normalize_base_path(path),
+            host_header,
+        })
+    }
+
+    fn target_for_request_path(&self, request_path: &str) -> String {
+        join_paths(&self.base_path, request_path)
+    }
+}
+
+fn parse_authority(authority: &str) -> Result<(String, u16), ProxyRuntimeError> {
+    if authority.starts_with('[') {
+        let Some(host_end) = authority.find(']') else {
+            return Err(ProxyRuntimeError::MissingUpstreamHost {
+                upstream_url: format!("http://{authority}"),
+            });
+        };
+        let host = authority[1..host_end].to_owned();
+        let port = authority
+            .get(host_end + 1..)
+            .and_then(|suffix| suffix.strip_prefix(':'))
+            .map(parse_port)
+            .transpose()?
+            .unwrap_or(80);
+        return Ok((host, port));
+    }
+
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host.to_owned(), parse_port(port)?),
+        None => (authority.to_owned(), 80),
+    };
+
+    if host.is_empty() {
+        return Err(ProxyRuntimeError::MissingUpstreamHost {
+            upstream_url: format!("http://{authority}"),
+        });
+    }
+
+    Ok((host, port))
+}
+
+fn parse_port(port: &str) -> Result<u16, ProxyRuntimeError> {
+    port.parse()
+        .map_err(|_| ProxyRuntimeError::InvalidUpstreamPort {
+            port: port.to_owned(),
+        })
+}
+
+fn normalize_base_path(path: &str) -> String {
+    let trimmed = path.trim_matches('/');
+
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+fn join_paths(base_path: &str, request_path: &str) -> String {
+    if base_path.is_empty() {
+        return request_path.to_owned();
+    }
+
+    let (path, query) = request_path
+        .split_once('?')
+        .map(|(path, query)| (path, Some(query)))
+        .unwrap_or((request_path, None));
+    let joined = format!(
+        "{}/{}",
+        base_path.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
+
+    query
+        .map(|query| format!("{joined}?{query}"))
+        .unwrap_or(joined)
+}
+
+fn build_upstream_request(
+    raw_request: &str,
+    upstream: &ParsedUpstream,
+) -> Result<Vec<u8>, ProxyRuntimeError> {
+    let request = parse_http_request(raw_request)?;
+    let target = upstream.target_for_request_path(&request.path);
+    let mut output = Vec::new();
+
+    write!(output, "{} {} HTTP/1.1\r\n", request.method, target)
+        .expect("writing to Vec cannot fail");
+
+    let mut saw_host = false;
+    let mut saw_connection = false;
+    let mut saw_content_length = false;
+
+    for (name, value) in &request.headers {
+        if name.eq_ignore_ascii_case("host") {
+            saw_host = true;
+            write!(output, "Host: {}\r\n", upstream.host_header)
+                .expect("writing to Vec cannot fail");
+        } else if name.eq_ignore_ascii_case("connection") {
+            saw_connection = true;
+            output.extend_from_slice(b"Connection: close\r\n");
+        } else if name.eq_ignore_ascii_case("proxy-connection") {
+            continue;
+        } else if name.eq_ignore_ascii_case("content-length") {
+            saw_content_length = true;
+            write!(output, "Content-Length: {}\r\n", request.body.len())
+                .expect("writing to Vec cannot fail");
+        } else {
+            write!(output, "{}: {}\r\n", name, value).expect("writing to Vec cannot fail");
+        }
+    }
+
+    if !saw_host {
+        write!(output, "Host: {}\r\n", upstream.host_header).expect("writing to Vec cannot fail");
+    }
+    if !saw_connection {
+        output.extend_from_slice(b"Connection: close\r\n");
+    }
+    if !request.body.is_empty() && !saw_content_length {
+        write!(output, "Content-Length: {}\r\n", request.body.len())
+            .expect("writing to Vec cannot fail");
+    }
+
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(request.body.as_bytes());
+
+    Ok(output)
+}
+
+fn send_upstream_request(upstream: &ParsedUpstream, request: &[u8]) -> io::Result<Vec<u8>> {
+    let mut stream = TcpStream::connect((upstream.host.as_str(), upstream.port))?;
+    stream.write_all(request)?;
+    stream.flush()?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    Ok(response)
+}
+
+fn response_body_string(response_bytes: &[u8]) -> String {
+    let body_start = response_bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+        .or_else(|| {
+            response_bytes
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|index| index + 2)
+        })
+        .unwrap_or(0);
+
+    String::from_utf8_lossy(&response_bytes[body_start..]).into_owned()
+}
+
+fn write_proxy_error_response(mut stream: impl Write, error: ProxyRuntimeError) -> io::Result<()> {
+    let response_body = format!(
+        "{{\"status\":\"bad_gateway\",\"error\":\"{}\"}}\n",
+        escape_json_string(&redact_provider_error(&error.to_string()))
+    );
+
+    write!(
+        stream,
+        "HTTP/1.1 502 Bad Gateway\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        response_body.len(),
+        response_body
+    )
+}
+
+fn core_events_from_proxy_events(
+    events: &[AttributionEvent],
+    usage: ProviderUsage,
+    timestamp_ms: u64,
+    adapter: &str,
+) -> Vec<AttributedTokenEvent> {
+    if events.is_empty() {
+        return usage
+            .has_any_usage()
+            .then(|| {
+                let mode = ModeState::passive();
+                AttributedTokenEvent {
+                    timestamp_ms,
+                    mode: mode.mode,
+                    run_id: "proxy-passive".to_owned(),
+                    task_id: mode.task_id,
+                    profile_id: mode.profile_id,
+                    adapter: adapter.to_owned(),
+                    operation_class: OperationClass::Other,
+                    tool: "proxy.usage".to_owned(),
+                    tokens: token_counts_from_usage(usage),
+                    byte_count: 0,
+                    content_digest: digest_bytes(b"proxy:usage"),
+                    repeat_of: None,
+                }
+            })
+            .into_iter()
+            .collect();
+    }
+
+    events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| AttributedTokenEvent {
+            timestamp_ms: timestamp_ms.saturating_add(index as u64),
+            mode: event.mode,
+            run_id: format!("proxy-{}", event.task_id),
+            task_id: event.task_id.clone(),
+            profile_id: event.profile_id.clone(),
+            adapter: adapter.to_owned(),
+            operation_class: OperationClass::from_str_or_other(&event.op_class),
+            tool: safe_event_tool(&event.tool),
+            tokens: event
+                .token_allocation
+                .as_ref()
+                .map(|allocation| {
+                    TokenCounts::new(
+                        allocation.input_tokens,
+                        allocation.output_tokens,
+                        allocation.cache_read_tokens,
+                        allocation.cache_write_tokens,
+                    )
+                })
+                .unwrap_or_else(|| token_counts_from_usage(usage)),
+            byte_count: event.byte_count,
+            content_digest: digest_bytes(
+                format!("proxy:{}:{}:{}", event.task_id, event.op_class, index).as_bytes(),
+            ),
+            repeat_of: None,
+        })
+        .collect()
+}
+
+fn token_counts_from_usage(usage: ProviderUsage) -> TokenCounts {
+    TokenCounts::new(
+        usage.input_tokens.unwrap_or(0),
+        usage.output_tokens.unwrap_or(0),
+        usage.cache_read_tokens.unwrap_or(0),
+        usage.cache_write_tokens.unwrap_or(0),
+    )
+}
+
+fn safe_event_tool(tool: &str) -> String {
+    let sanitized: String = tool
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    if sanitized.trim_matches('-').is_empty() {
+        "proxy.tool".to_owned()
+    } else {
+        sanitized
+    }
+}
+
+fn render_core_event_log_records(
+    events: &[AttributedTokenEvent],
+) -> Result<Vec<u8>, ProxyRuntimeError> {
+    let mut records = Vec::new();
+
+    for event in events {
+        EventLog::append_event(&mut records, event)?;
+    }
+
+    Ok(records)
+}
+
+fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(1)
+        .max(1)
 }
 
 fn render_persisted_log_line(
@@ -631,6 +1018,113 @@ mod tests {
                 .persisted_log_line
                 .contains("\"op_class\":\"test.output\"")
         );
+    }
+
+    #[test]
+    fn upstream_request_builder_and_capture_preserve_usage() {
+        let response_body = r#"{"usage":{"input_tokens":44,"output_tokens":11,"cache_read_tokens":8,"cache_write_tokens":2},"content":[{"type":"tool_result","tool_use_id":"call_1","content":"PRIVATE_CONTENT_FIXTURE","input_tokens":44,"output_tokens":11,"cache_read_tokens":8,"cache_write_tokens":2}]}"#;
+        let upstream = ParsedUpstream::parse("http://127.0.0.1:43210/provider").unwrap();
+        let request_body = r#"{"messages":[{"tool_calls":[{"id":"call_1","type":"tool_call","name":"Bash","arguments":"git status --short"}]}]}"#;
+        let request = format!(
+            concat!(
+                "POST /v1/responses?api_key=PRIVATE_CREDENTIAL_FIXTURE HTTP/1.1\r\n",
+                "Host: proxy.local\r\n",
+                "Authorization: Bearer sk-live-forward-secret\r\n",
+                "Content-Type: application/json\r\n",
+                "Content-Length: {}\r\n",
+                "\r\n",
+                "{}"
+            ),
+            request_body.len(),
+            request_body
+        );
+
+        let upstream_request =
+            String::from_utf8(build_upstream_request(&request, &upstream).unwrap()).unwrap();
+        let capture = process_proxy_exchange(&request, response_body).unwrap();
+
+        assert!(
+            upstream_request.contains(
+                "POST /provider/v1/responses?api_key=PRIVATE_CREDENTIAL_FIXTURE HTTP/1.1"
+            )
+        );
+        assert!(upstream_request.contains("Host: 127.0.0.1:43210"));
+        assert!(upstream_request.contains("Authorization: Bearer sk-live-forward-secret"));
+        assert_eq!(capture.path, "/v1/responses?[REDACTED_QUERY]");
+        assert_eq!(capture.usage.input_tokens, Some(44));
+        assert_eq!(capture.usage.output_tokens, Some(11));
+        assert_eq!(capture.usage.cache_read_tokens, Some(8));
+        assert_eq!(capture.usage.cache_write_tokens, Some(2));
+        assert_eq!(capture.events, Vec::new());
+        assert_eq!(capture.core_events.len(), 1);
+        assert_eq!(capture.core_events[0].tokens.input_tokens, 44);
+        assert_eq!(capture.core_events[0].tokens.cache_read_tokens, 8);
+        assert_eq!(
+            capture.core_events[0].operation_class,
+            crate::core::OperationClass::Other
+        );
+
+        let parsed =
+            crate::core::EventLog::read_from(capture.event_log_records.as_slice()).unwrap();
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(
+            parsed.events[0].operation_class,
+            crate::core::OperationClass::Other
+        );
+    }
+
+    #[test]
+    fn forwarded_proxy_capture_does_not_persist_credentials_or_content() {
+        let response_body = r#"{"usage":{"input_tokens":7,"output_tokens":3},"content":[{"type":"tool_result","tool":"Read","content":"SECRET_RAW_TOOL_OUTPUT"}],"authorization":"Bearer sk-response-secret"}"#;
+        let request_body =
+            r#"{"prompt":"PROMPT_SHOULD_NOT_PERSIST","content":"CONTENT_SHOULD_NOT_PERSIST"}"#;
+        let request = format!(
+            concat!(
+                "POST /v1/messages?api_key=PRIVATE_CREDENTIAL_FIXTURE HTTP/1.1\r\n",
+                "Host: proxy.local\r\n",
+                "Authorization: Bearer sk-live-forward-secret\r\n",
+                "X-API-KEY: TOKMETER_FIXTURE_SECRET\r\n",
+                "Content-Length: {}\r\n",
+                "\r\n",
+                "{}"
+            ),
+            request_body.len(),
+            request_body
+        );
+
+        let capture = process_proxy_exchange(&request, response_body).unwrap();
+        let persisted = format!(
+            "{:?}\n{}\n{}",
+            capture,
+            capture.persisted_log_line,
+            String::from_utf8(capture.event_log_records.clone()).unwrap()
+        );
+        let failures = crate::proxy_privacy::scan_persisted_log_string(&persisted);
+
+        assert_eq!(failures, Vec::new());
+        assert!(!persisted.contains("sk-live-forward-secret"));
+        assert!(!persisted.contains("TOKMETER_FIXTURE_SECRET"));
+        assert!(!persisted.contains("PROMPT_SHOULD_NOT_PERSIST"));
+        assert!(!persisted.contains("CONTENT_SHOULD_NOT_PERSIST"));
+        assert!(!persisted.contains("SECRET_RAW_TOOL_OUTPUT"));
+    }
+
+    #[test]
+    fn proxy_capture_emits_unattributed_core_event_when_usage_has_no_tool_result() {
+        let request = "POST /v1/responses HTTP/1.1\r\n\r\n{\"input\":\"PRIVATE_PROMPT_FIXTURE\"}";
+        let response = r#"{"usage":{"input_tokens":5,"output_tokens":2}}"#;
+
+        let capture = process_proxy_exchange(request, response).unwrap();
+
+        assert_eq!(capture.events, Vec::new());
+        assert_eq!(capture.core_events.len(), 1);
+        assert_eq!(
+            capture.core_events[0].operation_class,
+            crate::core::OperationClass::Other
+        );
+        assert_eq!(capture.core_events[0].tokens.input_tokens, 5);
+        assert_eq!(capture.core_events[0].tokens.output_tokens, 2);
+        assert!(!capture.event_log_records.is_empty());
     }
 
     #[test]
