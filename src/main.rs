@@ -25,6 +25,7 @@ use vc_tokmeter::install::{
     UninstallPlan, agent_config_after_init, agent_config_after_uninstall, plan_init,
     plan_uninstall, render_init_summary, render_uninstall_summary,
 };
+use vc_tokmeter::mcp_git::{McpGitConfig, run_mcp_git_server};
 use vc_tokmeter::proxy::{ProxyConfig, run_proxy, serve_proxy_listener};
 use vc_tokmeter::tasks::{Task, TaskManifest};
 
@@ -43,6 +44,7 @@ fn main() {
         }
         Some("init") => command_init(),
         Some("hook") => command_hook(&args),
+        Some("mcp-git") => command_mcp_git(&args),
         Some("proxy") => command_proxy(&args),
         Some("codex-tui") => command_codex_tui(&args),
         Some("run") => command_run(&args),
@@ -74,6 +76,7 @@ Usage:
 Commands:
   init       Plan local passive capture wiring
   hook       Execute a local agent hook payload from stdin
+  mcp-git    Run stdio MCP git tools for desktop apps
   proxy      Run the localhost-only provider proxy
   codex-tui  Launch interactive Codex through the local proxy
   run        Enter comparison protocol (Mode T) for a task/profile
@@ -252,6 +255,27 @@ fn command_hook(args: &[String]) -> Result<(), String> {
         event_log.display()
     );
     Ok(())
+}
+
+fn command_mcp_git(args: &[String]) -> Result<(), String> {
+    let event_log = value_after(args, "--event-log")
+        .map(PathBuf::from)
+        .unwrap_or(default_event_log_path()?);
+    let workdir = value_after(args, "--workdir")
+        .map(PathBuf::from)
+        .unwrap_or(current_dir()?);
+    let run_id = value_after(args, "--run-id")
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("mcp-git-{}", unix_time_ms()));
+    let config = McpGitConfig {
+        event_log_path: event_log,
+        workdir,
+        run_id,
+    };
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    run_mcp_git_server(stdin.lock(), stdout.lock(), config)
+        .map_err(|error| format!("mcp-git failed: {error}"))
 }
 
 fn command_proxy(args: &[String]) -> Result<(), String> {

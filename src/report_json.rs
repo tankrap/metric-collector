@@ -87,6 +87,15 @@ pub struct GitWorkflowRow<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SessionGitShare<'a> {
+    pub total_tokens: u64,
+    pub git_tokens: u64,
+    pub non_git_tokens: u64,
+    pub git_token_share: f64,
+    pub fidelity: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CompletionRates {
     pub tasks: CompletionRate,
     pub runs: CompletionRate,
@@ -168,6 +177,7 @@ pub struct CalibrationMetadata<'a> {
 pub struct ReportJson<'a> {
     pub evidence_grade: EvidenceGrade,
     pub totals: Totals,
+    pub session_git_share: SessionGitShare<'a>,
     pub run_profile_totals: &'a [RunProfileTotals<'a>],
     pub class_shares: &'a [ClassShare<'a>],
     pub token_sources: TokenSourceBreakdown<'a>,
@@ -212,6 +222,9 @@ impl ReportJson<'_> {
 
         write_field_name(&mut out, 1, "totals");
         write_totals(&mut out, 1, &self.totals);
+        out.push_str(",\n");
+
+        write_session_git_share(&mut out, &self.session_git_share);
         out.push_str(",\n");
 
         write_run_profile_totals(&mut out, self.run_profile_totals);
@@ -383,6 +396,18 @@ fn write_totals(out: &mut String, indent: usize, totals: &Totals) {
     write_u64_field(out, indent + 1, "total_tokens", totals.total_tokens, true);
     write_u64_field(out, indent + 1, "byte_count", totals.byte_count, false);
     write_indent(out, indent);
+    out.push('}');
+}
+
+fn write_session_git_share(out: &mut String, share: &SessionGitShare<'_>) {
+    write_field_name(out, 1, "session_git_share");
+    out.push_str("{\n");
+    write_u64_field(out, 2, "total_tokens", share.total_tokens, true);
+    write_u64_field(out, 2, "git_tokens", share.git_tokens, true);
+    write_u64_field(out, 2, "non_git_tokens", share.non_git_tokens, true);
+    write_f64_field(out, 2, "git_token_share", share.git_token_share, true);
+    write_str_field(out, 2, "fidelity", share.fidelity, false);
+    write_indent(out, 1);
     out.push('}');
 }
 
@@ -817,6 +842,13 @@ mod tests {
                 total_tokens: 215,
                 byte_count: 2560,
             },
+            session_git_share: SessionGitShare {
+                total_tokens: 215,
+                git_tokens: 70,
+                non_git_tokens: 145,
+                git_token_share: 70.0 / 215.0,
+                fidelity: "mixed",
+            },
             run_profile_totals: &run_profile_totals,
             class_shares: &class_shares,
             token_sources: TokenSourceBreakdown::default(),
@@ -899,6 +931,7 @@ mod tests {
         let report = ReportJson {
             evidence_grade: EvidenceGrade::GradeO,
             totals: Totals::default(),
+            session_git_share: SessionGitShare::default(),
             run_profile_totals: &run_profile_totals,
             class_shares: &class_shares,
             token_sources: TokenSourceBreakdown::default(),

@@ -148,6 +148,10 @@ edit echoes, test output, and build output. Use `token_sources` when you want
 to separate hook records, exact proxy usage, estimated proxy records, transcript
 imports, and request/response direction where the adapter provides it.
 
+For Claude Desktop and other MCP-capable desktop apps, use the local MCP git
+adapter so git operations flow through tokmeter-managed tools. See
+[desktop-mcp.md](desktop-mcp.md).
+
 ## Local deterministic smoke test
 
 Use the synthetic smoke test when changing docs, fixtures, or report wiring and

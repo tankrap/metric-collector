@@ -56,9 +56,19 @@ pub struct ProfileSummary<'a> {
     pub total_tokens: u64,
     pub byte_count: u64,
     pub completion_rates: CompletionRates,
+    pub session_git_share: Option<SessionGitShare<'a>>,
     pub token_distribution: Option<Distribution>,
     pub token_sources: Option<TokenSourceSummary<'a>>,
     pub git_workflow: Option<GitWorkflowSummary<'a>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SessionGitShare<'a> {
+    pub total_tokens: u64,
+    pub git_tokens: u64,
+    pub non_git_tokens: u64,
+    pub git_token_share: f64,
+    pub fidelity: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -290,6 +300,9 @@ fn write_profile_summary(out: &mut String, summary: &ProfileSummary<'_>, grade: 
     }
 
     out.push('\n');
+    if let Some(session_git_share) = summary.session_git_share {
+        write_session_git_share(out, &session_git_share, grade);
+    }
     if let Some(token_sources) = summary.token_sources {
         write_token_sources(out, &token_sources, grade);
     }
@@ -297,6 +310,33 @@ fn write_profile_summary(out: &mut String, summary: &ProfileSummary<'_>, grade: 
         write_git_workflow(out, &git_workflow, grade);
     }
     write_single_completion_rates(out, &summary.completion_rates);
+}
+
+fn write_session_git_share(out: &mut String, share: &SessionGitShare<'_>, grade: EvidenceGrade) {
+    out.push_str("## Session git token share\n\n");
+    out.push_str("| Metric | Evidence | Value |\n");
+    out.push_str("| --- | --- | ---: |\n");
+    write_table_row(
+        out,
+        "Session total tokens",
+        grade,
+        &format_u64(share.total_tokens),
+    );
+    write_table_row(out, "Git tokens", grade, &format_u64(share.git_tokens));
+    write_table_row(
+        out,
+        "Non-git tokens",
+        grade,
+        &format_u64(share.non_git_tokens),
+    );
+    write_table_row(
+        out,
+        "Git token share",
+        grade,
+        &format_percent(share.git_token_share),
+    );
+    write_table_row(out, "Token fidelity", grade, share.fidelity);
+    out.push('\n');
 }
 
 fn write_token_sources(
@@ -751,6 +791,13 @@ mod tests {
                     median: Some(2_750.0),
                     iqr: Some(500.5),
                 }),
+                session_git_share: Some(SessionGitShare {
+                    total_tokens: 13_750,
+                    git_tokens: 1_375,
+                    non_git_tokens: 12_375,
+                    git_token_share: 0.1,
+                    fidelity: "estimated",
+                }),
                 token_sources: None,
                 git_workflow: Some(GitWorkflowSummary {
                     event_count: 2,
@@ -776,6 +823,9 @@ mod tests {
         assert!(markdown.contains("| Metric | Evidence | Value |"));
         assert!(markdown.contains("| Total tokens | Grade O | 13,750 |"));
         assert!(markdown.contains("| IQR tokens | Grade O | 500.5 |"));
+        assert!(markdown.contains("## Session git token share"));
+        assert!(markdown.contains("| Git tokens | Grade O | 1,375 |"));
+        assert!(markdown.contains("| Token fidelity | Grade O | estimated |"));
         assert!(markdown.contains("## Git workflow tokens"));
         assert!(markdown.contains("| Git token share | Grade O | 10.0% |"));
         assert!(markdown.contains(

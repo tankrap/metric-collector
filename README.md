@@ -63,6 +63,8 @@ run Codex through `tokmeter proxy`; see
 [docs/distribution.md](docs/distribution.md#local-proxy-runtime).
 For the study workflow that measures passive AI-assisted git token volume, see
 [docs/study-workflow.md](docs/study-workflow.md).
+For Claude Desktop and other MCP-capable desktop apps, see
+[docs/desktop-mcp.md](docs/desktop-mcp.md).
 For long interactive Codex TUI sessions, use the wrapper so collection runs for
 the full session:
 

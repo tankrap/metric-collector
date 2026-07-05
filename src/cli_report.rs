@@ -197,11 +197,13 @@ fn event_log_report_json(events: &[AttributedTokenEvent]) -> String {
     let token_sources = report_json::TokenSourceBreakdown {
         rows: &token_source_rows,
     };
+    let session_git_share = aggregate.session_git_share_json();
     let warnings = [EVENT_LOG_REPORT_WARNING];
 
     report_json::serialize_report_json(&report_json::ReportJson {
         evidence_grade: report_json::EvidenceGrade::GradeO,
         totals: aggregate.totals,
+        session_git_share,
         run_profile_totals: &run_profile_totals,
         class_shares: &class_shares,
         token_sources,
@@ -229,6 +231,7 @@ fn event_log_report_markdown(events: &[AttributedTokenEvent]) -> String {
     let token_sources = report_markdown::TokenSourceSummary {
         rows: &token_source_rows,
     };
+    let session_git_share = aggregate.session_git_share_markdown();
     let warnings = [EVENT_LOG_REPORT_WARNING];
 
     report_markdown::serialize_report_markdown(&report_markdown::MarkdownReport {
@@ -249,6 +252,7 @@ fn event_log_report_markdown(events: &[AttributedTokenEvent]) -> String {
                 tasks: completion_rate_to_markdown(aggregate.completion_rates().tasks),
                 runs: completion_rate_to_markdown(aggregate.completion_rates().runs),
             },
+            session_git_share: Some(session_git_share),
             token_distribution: None,
             token_sources: Some(token_sources),
             git_workflow: Some(git_workflow),
@@ -284,11 +288,13 @@ fn compare_report_json(compare: &CompareReportAggregate) -> String {
     let token_sources = report_json::TokenSourceBreakdown {
         rows: &token_source_rows,
     };
+    let session_git_share = compare.session_git_share_json();
     let warnings = [COMPARE_REPORT_WARNING];
 
     report_json::serialize_report_json(&report_json::ReportJson {
         evidence_grade: report_json::EvidenceGrade::GradeP,
         totals: compare.totals,
+        session_git_share,
         run_profile_totals: &run_profile_totals,
         class_shares: &class_shares,
         token_sources,
@@ -676,6 +682,14 @@ impl CompareReportAggregate {
         self.token_sources.json_rows(self.totals.total_tokens)
     }
 
+    fn session_git_share_json(&self) -> report_json::SessionGitShare<'static> {
+        session_git_share_json(
+            self.totals.total_tokens,
+            self.git_workflow.totals.total_tokens,
+            self.token_sources.fidelity_label(),
+        )
+    }
+
     fn git_workflow_json<'a>(
         &self,
         rows: &'a [report_json::GitWorkflowRow<'a>],
@@ -896,6 +910,14 @@ impl EventLogAggregate {
         self.token_sources.json_rows(self.totals.total_tokens)
     }
 
+    fn session_git_share_json(&self) -> report_json::SessionGitShare<'static> {
+        session_git_share_json(
+            self.totals.total_tokens,
+            self.git_workflow.totals.total_tokens,
+            self.token_sources.fidelity_label(),
+        )
+    }
+
     fn git_workflow_json<'a>(
         &self,
         rows: &'a [report_json::GitWorkflowRow<'a>],
@@ -909,6 +931,14 @@ impl EventLogAggregate {
 
     fn token_source_markdown_rows(&self) -> Vec<report_markdown::TokenSourceRow<'_>> {
         self.token_sources.markdown_rows(self.totals.total_tokens)
+    }
+
+    fn session_git_share_markdown(&self) -> report_markdown::SessionGitShare<'static> {
+        session_git_share_markdown(
+            self.totals.total_tokens,
+            self.git_workflow.totals.total_tokens,
+            self.token_sources.fidelity_label(),
+        )
     }
 
     fn git_workflow_markdown<'a>(
@@ -969,6 +999,54 @@ impl TokenSourceAggregate {
                 token_share: ratio_or_zero(totals.total_tokens, total_tokens),
             })
             .collect()
+    }
+
+    fn fidelity_label(&self) -> &'static str {
+        let mut has_exact = false;
+        let mut has_estimated = false;
+
+        for source in self.rows.keys() {
+            if source.contains("exact") {
+                has_exact = true;
+            } else {
+                has_estimated = true;
+            }
+        }
+
+        match (has_exact, has_estimated) {
+            (true, true) => "mixed",
+            (true, false) => "exact",
+            (false, true) => "estimated",
+            (false, false) => "unknown",
+        }
+    }
+}
+
+fn session_git_share_json(
+    total_tokens: u64,
+    git_tokens: u64,
+    fidelity: &'static str,
+) -> report_json::SessionGitShare<'static> {
+    report_json::SessionGitShare {
+        total_tokens,
+        git_tokens,
+        non_git_tokens: total_tokens.saturating_sub(git_tokens),
+        git_token_share: ratio_or_zero(git_tokens, total_tokens),
+        fidelity,
+    }
+}
+
+fn session_git_share_markdown(
+    total_tokens: u64,
+    git_tokens: u64,
+    fidelity: &'static str,
+) -> report_markdown::SessionGitShare<'static> {
+    report_markdown::SessionGitShare {
+        total_tokens,
+        git_tokens,
+        non_git_tokens: total_tokens.saturating_sub(git_tokens),
+        git_token_share: ratio_or_zero(git_tokens, total_tokens),
+        fidelity,
     }
 }
 
@@ -1086,6 +1164,12 @@ fn token_source_label(event: &AttributedTokenEvent) -> &'static str {
             "request" => "transcript request",
             "response" => "transcript response",
             _ => "transcript import",
+        }
+    } else if adapter.starts_with("mcp.") {
+        match direction {
+            "request" => "mcp tool request",
+            "response" => "mcp tool response",
+            _ => "mcp tool",
         }
     } else {
         "other"
@@ -1279,6 +1363,7 @@ fn passive_self_report_json() -> String {
     report_json::serialize_report_json(&report_json::ReportJson {
         evidence_grade: report_json::EvidenceGrade::GradeO,
         totals,
+        session_git_share: session_git_share_json(totals.total_tokens, 960, "estimated"),
         run_profile_totals: &run_profile_totals,
         class_shares: &class_shares,
         token_sources: report_json::TokenSourceBreakdown::default(),
@@ -1355,6 +1440,11 @@ fn passive_self_report_markdown() -> String {
                     rate: 0.0,
                 },
             },
+            session_git_share: Some(session_git_share_markdown(
+                totals.total_tokens,
+                960,
+                "estimated",
+            )),
             token_distribution: None,
             token_sources: None,
             git_workflow: Some(report_markdown::GitWorkflowSummary {
