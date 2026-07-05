@@ -48,7 +48,7 @@ Useful options:
 ```sh
 # Install a specific release tag.
 curl -fsSL https://raw.githubusercontent.com/tankrap/metric-collector/main/install.sh | sh -s -- \
-  --version v0.1.0
+  --version v0.1.1
 
 # Install from another GitHub repo, useful for forks.
 curl -fsSL https://raw.githubusercontent.com/tankrap/metric-collector/main/install.sh | sh -s -- \
