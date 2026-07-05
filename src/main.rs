@@ -25,12 +25,23 @@ use vc_tokmeter::install::{
     UninstallPlan, agent_config_after_init, agent_config_after_uninstall, plan_init,
     plan_uninstall, render_init_summary, render_uninstall_summary,
 };
+use vc_tokmeter::live_test::{
+    DEFAULT_PROMPT, LiveTestRequest, LiveTestSurface, plan_live_test, render_live_test_plan,
+    render_live_test_usage,
+};
 use vc_tokmeter::mcp_git::{McpGitConfig, run_mcp_git_server};
 use vc_tokmeter::proxy::{ProxyConfig, run_proxy, serve_proxy_listener};
+use vc_tokmeter::setup::{
+    FsSetupEnvironment, SetupRequest, UploadSetup, detect_surfaces, plan_setup, render_setup_plan,
+};
 use vc_tokmeter::structured_import::{
     StructuredUsageDefaults, append_codex_exec_jsonl_to_event_log,
 };
 use vc_tokmeter::tasks::{Task, TaskManifest};
+use vc_tokmeter::upload::{
+    UploadPlanRequest, default_upload_config_path, prepare_upload_plan, remove_upload_config,
+    render_upload_plan, render_upload_response, send_upload, write_upload_config,
+};
 
 fn main() {
     let mut args: Vec<String> = env::args().skip(1).collect();
@@ -46,14 +57,17 @@ fn main() {
             Ok(())
         }
         Some("init") => command_init(),
+        Some("setup") => command_setup(&args),
         Some("hook") => command_hook(&args),
         Some("import-usage") => command_import_usage(&args),
         Some("mcp-git") => command_mcp_git(&args),
         Some("proxy") => command_proxy(&args),
         Some("codex-tui") => command_codex_tui(&args),
         Some("claude-code") => command_claude_code(&args),
+        Some("live-test") => command_live_test(&args),
         Some("run") => command_run(&args),
         Some("report") => command_report(&args),
+        Some("upload") => command_upload(&args),
         Some("status") => {
             print_status();
             Ok(())
@@ -80,6 +94,7 @@ Usage:
 
 Commands:
   init       Plan local passive capture wiring
+  setup      Configure a repo and print next commands for external testers
   hook       Execute a local agent hook payload from stdin
   import-usage
              Import structured usage JSONL into the event log
@@ -87,8 +102,10 @@ Commands:
   proxy      Run the localhost-only provider proxy
   codex-tui  Launch interactive Codex through the local proxy
   claude-code Launch interactive Claude Code through the local proxy
+  live-test  Print live test commands for Codex, Claude Code, and Claude Desktop
   run        Enter comparison protocol (Mode T) for a task/profile
   report     Generate local Grade O report artifacts
+  upload     Prepare or send an opt-in redacted metrics upload
   status     Show current capture mode and today's local summary
   doctor     Verify capture wiring and run a short self-test
   uninstall  Remove tokmeter-installed wiring
@@ -110,6 +127,139 @@ fn command_init() -> Result<(), String> {
     println!("Passive mode is active by default after init.");
     println!("Optional: use `vc-tokmeter run --profile baseline --task <task-id>` for Mode T.");
     Ok(())
+}
+
+fn command_setup(args: &[String]) -> Result<(), String> {
+    if has_flag(args, "-h") || has_flag(args, "--help") {
+        print_setup_usage();
+        return Ok(());
+    }
+
+    let mut repo = current_dir()?;
+    let mut tokmeter_bin = tokmeter_binary_command();
+    let mut upload = UploadSetup::LocalOnly;
+    let mut upload_endpoint: Option<String> = None;
+    let mut upload_token: Option<String> = None;
+    let mut remove_saved_upload_config = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--repo" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--repo requires a path".to_owned())?;
+                repo = PathBuf::from(value);
+            }
+            "--tokmeter-bin" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--tokmeter-bin requires a command".to_owned())?;
+                tokmeter_bin = value.clone();
+            }
+            "--local-only" => {
+                upload = UploadSetup::LocalOnly;
+            }
+            "--upload-endpoint" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--upload-endpoint requires a URL".to_owned())?;
+                upload_endpoint = Some(value.clone());
+            }
+            "--upload-token" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--upload-token requires a token".to_owned())?;
+                upload_token = Some(value.clone());
+            }
+            "--remove-upload-config" => {
+                remove_saved_upload_config = true;
+            }
+            other => return Err(format!("unknown setup argument: {other}")),
+        }
+        index += 1;
+    }
+
+    if !repo.is_dir() {
+        return Err(format!("repo does not exist: {}", repo.display()));
+    }
+
+    if remove_saved_upload_config {
+        if upload_endpoint.is_some() || upload_token.is_some() {
+            return Err(
+                "--remove-upload-config cannot be combined with upload enrollment flags".to_owned(),
+            );
+        }
+        let config_path = upload_config_path_for_repo(&repo);
+        let removed = remove_upload_config(&config_path)
+            .map_err(|error| format!("cannot remove upload config: {error}"))?;
+        if removed {
+            println!("upload config removed: {}", config_path.display());
+        } else {
+            println!("upload config already absent: {}", config_path.display());
+        }
+        return Ok(());
+    }
+
+    let upload_config_to_save = match (upload_endpoint, upload_token) {
+        (Some(endpoint), Some(token)) => {
+            upload = UploadSetup::OptIn {
+                endpoint: endpoint.clone(),
+            };
+            Some((endpoint, token))
+        }
+        (Some(_), None) => return Err("--upload-endpoint requires --upload-token".to_owned()),
+        (None, Some(_)) => return Err("--upload-token requires --upload-endpoint".to_owned()),
+        (None, None) => None,
+    };
+
+    let init_request = init_request_for_repo(repo.clone())?;
+    let init_plan = plan_init(&init_request, None).map_err(|error| error.to_string())?;
+    apply_init_plan(&init_plan, &init_request)?;
+    if let Some((endpoint, token)) = upload_config_to_save.as_ref() {
+        write_upload_config(&upload_config_path_for_repo(&repo), endpoint, token)
+            .map_err(|error| format!("cannot save upload config: {error}"))?;
+    }
+
+    let setup_request = SetupRequest {
+        repo_root: repo,
+        tokmeter_bin,
+        upload,
+        detection: detect_surfaces(&FsSetupEnvironment),
+    };
+    let setup_plan = plan_setup(&setup_request);
+    print!("{}", render_init_summary(&init_plan));
+    print!("{}", render_setup_plan(&setup_plan));
+    println!("Verification:");
+    println!("  - {} doctor", setup_request.tokmeter_bin);
+    if matches!(setup_request.upload, UploadSetup::OptIn { .. }) {
+        println!("  - {} upload --dry-run", setup_request.tokmeter_bin);
+        println!("  - {} upload --yes", setup_request.tokmeter_bin);
+    }
+    Ok(())
+}
+
+fn print_setup_usage() {
+    println!(
+        "\
+Usage:
+  vc-tokmeter setup [--repo PATH] [--local-only]
+  vc-tokmeter setup [--repo PATH] --upload-endpoint URL --upload-token TOKEN
+  vc-tokmeter setup [--repo PATH] --remove-upload-config
+
+Options:
+  --repo PATH          Target repository to configure (default: current directory)
+  --tokmeter-bin CMD   Command printed in generated next steps
+  --local-only         Keep all reporting local (default)
+  --upload-endpoint URL
+                       Save opt-in collector endpoint with --upload-token
+  --upload-token TOKEN Save opt-in upload token; value is not printed
+  --remove-upload-config
+                       Remove saved opt-in upload endpoint and token"
+    );
 }
 
 fn command_uninstall() -> Result<(), String> {
@@ -236,6 +386,38 @@ fn command_report(args: &[String]) -> Result<(), String> {
         println!("report.share.json: {}", share_path.display());
     }
     println!("Evidence: Grade O observational; no savings headline is emitted.");
+    Ok(())
+}
+
+fn command_upload(args: &[String]) -> Result<(), String> {
+    let event_log = value_after(args, "--event-log")
+        .map(PathBuf::from)
+        .unwrap_or(default_event_log_path()?);
+    let out_dir = value_after(args, "--out")
+        .map(PathBuf::from)
+        .unwrap_or(current_dir()?.join(".tokmeter").join("report"));
+    let dry_run = upload_should_dry_run(args);
+    let request = UploadPlanRequest {
+        event_log_path: event_log,
+        out_dir,
+        endpoint: value_after(args, "--endpoint").map(str::to_owned),
+        token: value_after(args, "--token").map(str::to_owned),
+        config_path: value_after(args, "--config").map(PathBuf::from),
+        dry_run,
+        yes: has_flag(args, "--yes"),
+    };
+    let plan =
+        prepare_upload_plan(&request).map_err(|error| format!("cannot prepare upload: {error}"))?;
+    print!("{}", render_upload_plan(&plan));
+    if !plan.dry_run {
+        let upload_request = plan
+            .request
+            .as_ref()
+            .ok_or_else(|| "cannot upload without endpoint and token".to_owned())?;
+        let response = send_upload(upload_request)
+            .map_err(|error| format!("cannot upload metrics payload: {error}"))?;
+        print!("{}", render_upload_response(&response));
+    }
     Ok(())
 }
 
@@ -531,17 +713,76 @@ fn command_claude_code(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn command_live_test(args: &[String]) -> Result<(), String> {
+    if args.is_empty() || has_flag(args, "-h") || has_flag(args, "--help") {
+        print!("{}", render_live_test_usage());
+        return Ok(());
+    }
+
+    let surface = args[0].parse::<LiveTestSurface>()?;
+    let mut repo = current_dir()?;
+    let mut prompt = DEFAULT_PROMPT.to_owned();
+    let mut tokmeter_bin = tokmeter_binary_command();
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--repo" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--repo requires a path".to_owned())?;
+                repo = PathBuf::from(value);
+            }
+            "--prompt" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--prompt requires text".to_owned())?;
+                prompt = value.clone();
+            }
+            "--tokmeter-bin" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--tokmeter-bin requires a command".to_owned())?;
+                tokmeter_bin = value.clone();
+            }
+            other => return Err(format!("unknown live-test argument: {other}")),
+        }
+        index += 1;
+    }
+
+    if !repo.is_dir() {
+        return Err(format!("repo does not exist: {}", repo.display()));
+    }
+
+    let request = LiveTestRequest::new(surface, repo)
+        .with_prompt(prompt)
+        .with_tokmeter_bin(tokmeter_bin);
+    let plan = plan_live_test(&request);
+    print!("{}", render_live_test_plan(&plan));
+    Ok(())
+}
+
 fn default_init_request() -> Result<InitRequest, String> {
-    let cwd = current_dir()?;
+    init_request_for_repo(current_dir()?)
+}
+
+fn init_request_for_repo(repo: PathBuf) -> Result<InitRequest, String> {
     InitRequest::new(
-        &cwd,
-        cwd.join(".tokmeter").join("agent-config.toml"),
+        &repo,
+        repo.join(".tokmeter").join("agent-config.toml"),
         "http://127.0.0.1:17683",
     )
     .map_err(|error| error.to_string())
 }
 
+fn upload_config_path_for_repo(repo: &std::path::Path) -> PathBuf {
+    default_upload_config_path(&repo.join(".tokmeter").join("events.jsonl"))
+}
+
 fn apply_init_plan(plan: &InitPlan, request: &InitRequest) -> Result<(), String> {
+    let event_log_path = request.install_root.join(".tokmeter").join("events.jsonl");
     for record in &plan.records {
         match record.kind {
             InstallItemKind::Directory => {
@@ -558,7 +799,7 @@ fn apply_init_plan(plan: &InitPlan, request: &InitRequest) -> Result<(), String>
                         if record.path.file_name().and_then(|name| name.to_str())
                             == Some("claude-code-hook.json") =>
                     {
-                        claude_hook_file_content(&default_event_log_path()?)
+                        claude_hook_file_content(&event_log_path)
                     }
                     InstallAction::CreateFile
                         if record.path.file_name().and_then(|name| name.to_str())
@@ -585,7 +826,7 @@ fn apply_init_plan(plan: &InitPlan, request: &InitRequest) -> Result<(), String>
                             }
                             existing
                         } else {
-                            codex_hook_file_content(&default_event_log_path()?)
+                            codex_hook_file_content(&event_log_path)
                         }
                     }
                     InstallAction::CreateFile => {
@@ -817,6 +1058,7 @@ fn json_string(value: &str) -> String {
     out.push('"');
     out
 }
+
 fn value_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.windows(2)
         .find(|window| window[0] == flag)
@@ -825,6 +1067,10 @@ fn value_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 
 fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
+}
+
+fn upload_should_dry_run(args: &[String]) -> bool {
+    has_flag(args, "--dry-run") || !has_flag(args, "--yes")
 }
 
 fn split_wrapped_command(args: &[String]) -> (&[String], &[String]) {
@@ -869,6 +1115,91 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn temp_repo(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("vc-tokmeter-main-{name}-{nanos}"));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn setup_defaults_to_local_only_without_upload_config() {
+        let repo = temp_repo("local-only");
+
+        command_setup(&args(&["--repo", repo.to_str().unwrap()])).unwrap();
+
+        assert!(!repo.join(".tokmeter").join("upload.json").exists());
+    }
+
+    #[test]
+    fn setup_requires_explicit_endpoint_and_token_for_upload_config() {
+        let repo = temp_repo("upload-requires-pair");
+
+        let endpoint_only = command_setup(&args(&[
+            "--repo",
+            repo.to_str().unwrap(),
+            "--upload-endpoint",
+            "https://collector.example.test/upload",
+        ]))
+        .unwrap_err();
+        let token_only = command_setup(&args(&[
+            "--repo",
+            repo.to_str().unwrap(),
+            "--upload-token",
+            "secret-token",
+        ]))
+        .unwrap_err();
+
+        assert!(endpoint_only.contains("--upload-endpoint requires --upload-token"));
+        assert!(token_only.contains("--upload-token requires --upload-endpoint"));
+        assert!(!repo.join(".tokmeter").join("upload.json").exists());
+    }
+
+    #[test]
+    fn setup_saves_and_removes_opt_in_upload_config() {
+        let repo = temp_repo("upload-config");
+        let config = repo.join(".tokmeter").join("upload.json");
+
+        command_setup(&args(&[
+            "--repo",
+            repo.to_str().unwrap(),
+            "--upload-endpoint",
+            "https://collector.example.test/upload",
+            "--upload-token",
+            "saved-secret-token",
+        ]))
+        .unwrap();
+        let saved = fs::read_to_string(&config).unwrap();
+
+        assert!(saved.contains("\"enabled\": true"));
+        assert!(saved.contains("\"endpoint\": \"https://collector.example.test/upload\""));
+        assert!(saved.contains("\"upload_token\": \"saved-secret-token\""));
+
+        command_setup(&args(&[
+            "--repo",
+            repo.to_str().unwrap(),
+            "--remove-upload-config",
+        ]))
+        .unwrap();
+
+        assert!(!config.exists());
+    }
+
+    #[test]
+    fn upload_command_defaults_to_dry_run_until_yes_is_present() {
+        assert!(upload_should_dry_run(&args(&[])));
+        assert!(upload_should_dry_run(&args(&[
+            "--endpoint",
+            "https://example.test"
+        ])));
+        assert!(upload_should_dry_run(&args(&["--dry-run", "--yes"])));
+        assert!(!upload_should_dry_run(&args(&["--yes"])));
     }
 
     #[test]

@@ -11,9 +11,10 @@ outputs, or file contents anywhere.
 
 This repository is in early implementation. The source-checkout CLI can run the
 passive quickstart, produce first local Grade O report artifacts, enter Mode T
-run planning, run `doctor`, and remove tokmeter-created setup files. Full
-adapter capture, packaged installs, compare reports, and share export are still
-v1 work in progress.
+run planning, run `doctor`, guide external setup, and remove tokmeter-created
+setup files. Release packaging and checksum install scripts are available for
+macOS and Linux; full adapter capture, compare reports, and share export are
+still v1 work in progress.
 
 ## Passive Quickstart
 
@@ -24,10 +25,12 @@ cargo run -- --help
 ```
 
 Install options are documented in [docs/distribution.md](docs/distribution.md).
-Today the source checkout path is the only implemented path. Static binary,
-`npx`, and `pipx` wrappers are v1 distribution targets and are documented with
-their intended commands so tester instructions can stabilize before packaging
-lands.
+External testers can use the release installer, then run `vc-tokmeter setup`
+from the repository they want to measure. `npx` and `pipx` wrappers are still
+v1 distribution targets.
+For a one-page external tester flow with install, study prompts, report,
+optional upload, and uninstall, see
+[docs/tester-quickstart.md](docs/tester-quickstart.md).
 
 Passive-first source-checkout flow:
 
@@ -110,10 +113,10 @@ scripts/study-workflow-smoke.sh
 ```
 
 To run real Codex, Claude Code, and Claude Desktop test paths with less command
-memorization, use the live matrix helper:
+memorization, use the installed live-test command:
 
 ```sh
-scripts/live-agent-matrix.sh doctor --repo /path/to/repository
+vc-tokmeter live-test doctor --repo /path/to/repository
 ```
 
 See [docs/live-testing.md](docs/live-testing.md) for exact API-backed paths,
@@ -134,6 +137,19 @@ class without source, prompt, path, credential, or tool-output content.
 how to remove it, and includes a one-line pointer to optional task mode.
 `doctor` verifies the local wiring path with a short self-test. `report --share`
 is the planned redacted export path that a tester can manually choose to send.
+Upload enrollment is separate and opt-in:
+
+```sh
+vc-tokmeter setup --upload-endpoint https://collector.example.test/v1/uploads \
+  --upload-token "$VC_TOKMETER_UPLOAD_TOKEN"
+vc-tokmeter upload --dry-run
+vc-tokmeter upload --yes
+vc-tokmeter setup --remove-upload-config
+```
+
+The setup command saves the endpoint and token only when both upload flags are
+provided. Upload defaults to a dry-run review unless `--yes` is present, and
+rendered output describes the token source without printing the token value.
 
 ## Producing Comparison Numbers
 
@@ -153,6 +169,8 @@ vc-tokmeter is designed to be local-first:
   and run metadata.
 - There is no telemetry phone-home in v1.
 - Sharing is manual through `vc-tokmeter report --share`.
+- Hosted upload is a separate opt-in flow with a dry-run review and removable
+  `.tokmeter/upload.json` config.
 
 See [docs/privacy.md](docs/privacy.md) for the detailed trust model.
 

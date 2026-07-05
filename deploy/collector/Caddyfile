@@ -1,0 +1,177 @@
+{$COLLECTOR_DOMAIN} {
+	encode zstd gzip
+
+	request_body {
+		max_size 1MB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "interest-cohort=()"
+	}
+
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>headers>Authorization delete
+				request>headers>X-Admin-Token delete
+				request>headers>X-Upload-Token delete
+				request>headers>Cookie delete
+			}
+		}
+	}
+
+	@dashboard path /dashboard /dashboard/
+	handle @dashboard {
+		header Content-Type "text/html; charset=utf-8"
+		respond `<!doctype html>
+		<html lang="en">
+		<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1">
+		<title>Metric Taker Dashboard</title>
+		<style>
+		:root {
+			color-scheme: light dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+		}
+		body {
+			margin: 0; background: #f7f7f4; color: #1f2528; }
+			main {
+				max-width: 1120px; margin: 0 auto; padding: 32px 20px 48px;
+			}
+			header {
+				display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 16px; margin-bottom: 24px;
+			}
+			h1 {
+				margin: 0; font-size: 28px; line-height: 1.15; letter-spacing: 0;
+			}
+			label {
+				display: grid; gap: 6px; font-size: 13px; color: #4a5459; }
+				input, select, button {
+					min-height: 36px; border: 1px solid #bcc5c9; border-radius: 6px; padding: 0 10px; font: inherit; background: #fff; color: #1f2528; }
+					button {
+						border-color: #1f6feb; background: #1f6feb; color: #fff; cursor: pointer; }
+						.controls {
+							display: flex; flex-wrap: wrap; gap: 10px; align-items: end;
+						}
+						.grid {
+							display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin-bottom: 18px;
+						}
+						.tile, section {
+							border: 1px solid #d7dddf; border-radius: 8px; background: #fff; }
+							.tile {
+								padding: 16px;
+							}
+							.label {
+								font-size: 12px; color: #5b666b; }
+								.value {
+									margin-top: 8px; font-size: 24px; font-weight: 650;
+								}
+								section {
+									padding: 16px; margin-top: 12px; overflow: auto;
+								}
+								h2 {
+									margin: 0 0 12px; font-size: 16px;
+								}
+								table {
+									width: 100%; border-collapse: collapse; font-size: 13px;
+								}
+								th, td {
+									padding: 8px; border-bottom: 1px solid #e3e7e8; text-align: left; white-space: nowrap; }
+									.status {
+										min-height: 20px; color: #5b666b; font-size: 13px; }
+										@media (prefers-color-scheme: dark) {
+										body {
+										background: #15191b; color: #eef2f3; }
+										input, select, .tile, section {
+										background: #202629; color: #eef2f3; border-color: #3a4448; }
+										label, .label, .status {
+										color: #aab5ba; }
+										th, td {
+										border-bottom-color: #313a3e; }
+									}
+									</style>
+									</head>
+									<body>
+									<main>
+									<header>
+									<div>
+									<h1>Metric Taker Dashboard</h1>
+									<div class="status" id="status">Enter the admin token to load aggregate study metrics.</div>
+									</div>
+									<div class="controls">
+									<label>Admin token <input id="token" type="password" autocomplete="off"></label>
+									<label>Window
+									<select id="window">
+									<option value="all">All</option>
+									<option value="7d">7 days</option>
+									<option value="30d">30 days</option>
+									</select>
+									</label>
+									<button id="refresh" type="button">Refresh</button>
+									</div>
+									</header>
+									<div class="grid">
+									<div class="tile"><div class="label">Uploads</div><div class="value" id="uploads">-</div></div>
+									<div class="tile"><div class="label">Total tokens</div><div class="value" id="total">-</div></div>
+									<div class="tile"><div class="label">Git tokens</div><div class="value" id="git">-</div></div>
+									<div class="tile"><div class="label">Git share</div><div class="value" id="share">-</div></div>
+									</div>
+									<section><h2>Surfaces</h2><table id="surfaces"></table></section>
+									<section><h2>Git Actions</h2><table id="actions"></table></section>
+									</main>
+									<script>
+									const $ = (id) => document.getElementById(id);
+									const fmt = (value) => Number(value || 0).toLocaleString();
+									const pct = (value) => String(Math.round(Number(value || 0) * 1000) / 10) + "%";
+									async function api(path) {
+										const token = $("token").value.trim();
+										if (!token) throw new Error("Admin token is required");
+										const res = await fetch(path, {
+										headers: {
+										"X-Admin-Token": token
+									}
+								}								);
+								if (!res.ok) throw new Error(path + " returned " + res.status);
+								return res.json();
+							}
+							function rows(table, headers, data) {
+								table.innerHTML = "<thead><tr>" + headers.map((h) => "<th>" + h + "</th>").join("") + "</tr></thead>" +
+								"<tbody>" + data.map((row) => "<tr>" + row.map((cell) => "<td>" + cell + "</td>").join("") + "</tr>").join("") + "</tbody>";
+							}
+							async function refresh() {
+								$("status").textContent = "Loading aggregate metrics...";
+								const windowName = $("window").value;
+								const [summary, surfaces, actions] = await Promise.all([
+								api("/v1/dashboard/summary?window=" + windowName),
+								api("/v1/dashboard/surfaces?window=" + windowName),
+								api("/v1/dashboard/git-actions?window=" + windowName + "&limit=10"),
+								]);
+								$("uploads").textContent = fmt(summary.upload_count);
+								$("total").textContent = fmt(summary.total_tokens);
+								$("git").textContent = fmt(summary.git_tokens);
+								$("share").textContent = pct(summary.git_token_share);
+								rows($("surfaces"), ["Surface", "Uploads", "Tokens", "Git share"], surfaces.rows.map((row) => [
+								row.surface, fmt(row.upload_count), fmt(row.total_tokens), pct(row.git_token_share)
+								]));
+								rows($("actions"), ["Action", "Events", "Tokens", "Share"], actions.rows.map((row) => [
+								row.action_subtype, fmt(row.event_count), fmt(row.total_tokens), pct(row.share_of_all_tokens)
+								]));
+								$("status").textContent = "Loaded aggregate-only metrics.";
+							}
+							$("refresh").addEventListener("click", () => refresh().catch((err) => {
+								$("status").textContent = err.message;
+							}							));
+							</script>
+							</body>
+							</html>` 200
+						}
+
+						handle {
+							reverse_proxy collector:8080
+						}
+					}

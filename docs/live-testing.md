@@ -5,6 +5,10 @@ hand-assembling commands. The helper does not create synthetic token events.
 Each surface either launches a real agent path or prints the manual desktop
 configuration needed for live testing.
 
+Installed release users can run the same matrix through
+`vc-tokmeter live-test`; see [tester-quickstart.md](tester-quickstart.md) for
+the external tester path.
+
 Run commands from the `metric-collector` checkout and pass the repository you
 want to measure:
 

@@ -25,11 +25,18 @@ Local reports may use clear paths when that helps the tester understand their
 own data. Shared reports must replace paths and repository names with salted
 hashes and truncate digests.
 
-`report --share` is the only artifact testers should be asked to send. Sharing
-is explicit and manual. A share artifact may include aggregate token counts,
-operation classes, completion rates, warning labels, salted path/repository
-hashes, and truncated digests. It must not include prompts, source snippets,
-raw tool output, provider credentials, or unhashed private paths.
+`report --share` is the only local artifact testers should be asked to send
+manually. Sharing is explicit and manual. A share artifact may include
+aggregate token counts, operation classes, completion rates, warning labels,
+salted path/repository hashes, and truncated digests. It must not include
+prompts, source snippets, raw tool output, provider credentials, or unhashed
+private paths.
+
+Hosted collection, when implemented, must use the same redacted boundary. It is
+allowed only as an explicit opt-in upload of the aggregate payload documented in
+[`upload-schema.md`](upload-schema.md). The upload payload is not a transport
+for raw event logs, transcripts, prompts, source, tool output, exact paths,
+branch names, provider requests/responses, or credentials.
 
 Grade P comparison shares use the same redaction path as passive reports. They
 may include baseline/treatment profile labels, completed-task token totals,
@@ -44,14 +51,38 @@ protocol.
 
 ## Network Behavior
 
-v1 has no telemetry phone-home. The proxy adapter may forward the user's own
-provider traffic when explicitly configured, but tokmeter itself should not send
-measurement data to a project-owned service.
+Local measurement has no telemetry phone-home. The proxy adapter may forward the
+user's own provider traffic when explicitly configured, but tokmeter itself
+should not send measurement data to a project-owned service unless the tester
+chooses an explicit upload command.
 
-There is no automatic upload, background synchronization, anonymous
-aggregation, or opt-out analytics path in v1. Future aggregation, if any, must
-be a separate opt-in feature and should not change the meaning of
-`report --share`.
+There must be no automatic upload, background synchronization, hidden anonymous
+aggregation, or opt-out analytics path. Hosted aggregation is opt-in only. The
+first upload flow must show what is being sent, identify the schema version and
+study, and require affirmative consent before network transfer.
+
+`vc-tokmeter setup` defaults to local-only reporting. It saves upload endpoint
+and token values only when a tester provides both upload enrollment flags. The
+saved `.tokmeter/upload.json` file can be removed with
+`vc-tokmeter setup --remove-upload-config`. `vc-tokmeter upload` produces a
+dry-run payload review unless the tester passes `--yes`.
+
+Opt-in upload must remain separate from `report --share`: share creates a local
+redacted artifact, while upload sends a versioned aggregate payload to the
+configured collector. Disabling upload or uninstalling tokmeter must leave local
+reporting intact.
+
+## Uploaded Data Retention
+
+The default hosted retention target is 180 days for accepted aggregate upload
+payloads and 30 days for server access logs, unless a published study protocol
+uses a shorter window. Testers should be able to request deletion by tester
+alias, upload ID, or session hash when they can provide one of those
+identifiers.
+
+Deletion should remove the upload payload and derived dashboard rows that can
+still be linked to that payload. Published aggregate summaries may remain only
+when they can no longer be traced back to an individual tester or upload.
 
 ## Credentials
 
@@ -63,6 +94,9 @@ Credential-bearing upstream URLs are rejected by setup metadata helpers. Error
 messages and diagnostics should redact authorization headers, API-key-like
 values, bearer tokens, and provider response bodies before they are printed or
 persisted.
+
+Upload setup and upload rendering must identify whether a token came from a
+flag or config file without printing the token value itself.
 
 ## Uninstall
 

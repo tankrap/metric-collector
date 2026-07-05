@@ -1,0 +1,70 @@
+{
+  "schema_version": "vc-tokmeter.upload.v1",
+  "artifact_type": "vc-tokmeter.upload",
+  "created_at": "2026-07-05T15:30:00Z",
+  "prompt": "FORBIDDEN_PROMPT_MARKER",
+  "client": {
+    "tokmeter_version": "0.1.0",
+    "surface": "codex-tui",
+    "platform": {
+      "os": "macos",
+      "arch": "arm64"
+    }
+  },
+  "consent": {
+    "upload_opt_in": true,
+    "consent_version": "2026-07-05",
+    "tester_alias": "tester-a"
+  },
+  "study": {
+    "study_id": "metric-taker-t10",
+    "protocol_version": "2026-07-05"
+  },
+  "session": {
+    "session_id_hash": "0123456789abcdef",
+    "time_bucket_utc": "2026-07-05T15:00:00Z",
+    "duration_seconds": 1800
+  },
+  "metrics": {
+    "evidence_grade": "O",
+    "token_fidelity": "mixed",
+    "summary": {
+      "runs": 1,
+      "tasks": 2,
+      "events": 8,
+      "total_tokens": 1200,
+      "input_tokens": 700,
+      "output_tokens": 500,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "bytes": 4096
+    },
+    "session_git_share": {
+      "total_tokens": 1200,
+      "git_tokens": 240,
+      "non_git_tokens": 960,
+      "git_token_share": 0.2,
+      "fidelity": "mixed"
+    },
+    "token_sources": [],
+    "git_workflow": {
+      "totals": {
+        "runs": 1,
+        "tasks": 2,
+        "events": 0,
+        "total_tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "bytes": 0
+      },
+      "action_subtypes": []
+    }
+  },
+  "redaction": {
+    "source_artifact": "report-share",
+    "digest_hex_chars": 16,
+    "private_data_policy": "aggregate-only-no-raw-content"
+  }
+}

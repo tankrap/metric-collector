@@ -1,0 +1,53 @@
+services:
+  collector:
+    build:
+      context: ../../server/collector
+    image: ${COLLECTOR_IMAGE:-metric-taker-collector:local}
+    restart: unless-stopped
+    environment:
+      COLLECTOR_HOST: 0.0.0.0
+      COLLECTOR_PORT: 8080
+      COLLECTOR_DB: ${COLLECTOR_DB:-/data/collector.sqlite3}
+      COLLECTOR_UPLOAD_TOKEN: ${COLLECTOR_UPLOAD_TOKEN:?set COLLECTOR_UPLOAD_TOKEN}
+      COLLECTOR_ADMIN_TOKEN: ${COLLECTOR_ADMIN_TOKEN:?set COLLECTOR_ADMIN_TOKEN}
+      COLLECTOR_MAX_BODY_BYTES: ${COLLECTOR_MAX_BODY_BYTES:-1048576}
+      COLLECTOR_RATE_LIMIT_REQUESTS: ${COLLECTOR_RATE_LIMIT_REQUESTS:-60}
+      COLLECTOR_RATE_LIMIT_WINDOW_SECONDS: ${COLLECTOR_RATE_LIMIT_WINDOW_SECONDS:-60}
+    volumes:
+      - collector-data:/data
+    expose:
+      - "8080"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  caddy:
+    build:
+      context: .
+      dockerfile: Caddy.Dockerfile
+    image: ${CADDY_IMAGE:-metric-taker-caddy:local}
+    restart: unless-stopped
+    depends_on:
+      collector:
+        condition: service_healthy
+    ports:
+      - "${COLLECTOR_HTTP_PORT:-80}:80"
+      - "443:443"
+    environment:
+      COLLECTOR_DOMAIN: ${COLLECTOR_DOMAIN:-localhost}
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  collector-data:
+  caddy-data:
+  caddy-config:

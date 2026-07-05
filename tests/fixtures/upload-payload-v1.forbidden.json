@@ -1,0 +1,18 @@
+{
+  "schema_version": "vc-tokmeter.upload.v1",
+  "artifact_type": "vc-tokmeter.upload",
+  "prompt": "PROMPT_SHOULD_NOT_UPLOAD",
+  "session": {
+    "path": "/Users/example/private/repo/src/main.rs",
+    "branch_name": "secret-customer-branch"
+  },
+  "metrics": {
+    "raw_events": [
+      {
+        "tool_output": "TOOL_OUTPUT_SHOULD_NOT_UPLOAD",
+        "source": "fn source_code_should_not_upload() {}",
+        "authorization": "Bearer sk-upload-regression-secret"
+      }
+    ]
+  }
+}

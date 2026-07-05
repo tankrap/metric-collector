@@ -1,10 +1,63 @@
 # Distribution and Wrapper Commands
 
-vc-tokmeter is designed to support installed binaries and one-shot wrapper
-commands. This repository is still in early implementation, so the source
-checkout path is the currently usable route. The other commands below are the
-planned v1 user-facing commands and should not be published as working install
-instructions until packaging is wired.
+vc-tokmeter supports source-checkout development and installed release
+binaries. Release artifacts are published for macOS and Linux so external
+testers do not need Rust or a repository checkout.
+
+## Release Artifacts
+
+Tagged releases publish these tarballs:
+
+- `vc-tokmeter-macos-arm64.tar.gz`
+- `vc-tokmeter-macos-x64.tar.gz`
+- `vc-tokmeter-linux-arm64.tar.gz`
+- `vc-tokmeter-linux-x64.tar.gz`
+
+Each stable installer tarball also has a versioned companion named
+`vc-tokmeter-v<VERSION>-<platform>.tar.gz`. The release includes `SHA256SUMS`
+for installer verification and individual `.sha256` files for each tarball.
+
+Install the latest release with checksum verification:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/tankrap/metric-collector/main/install.sh | sh
+```
+
+By default this installs to `~/.local/bin`. To install elsewhere:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/tankrap/metric-collector/main/install.sh | sh -s -- \
+  --prefix /usr/local
+```
+
+The installer verifies the tarball checksum before copying `vc-tokmeter`. It
+prints PATH guidance when the install directory is not already on `PATH` and
+does not edit shell profiles.
+
+## Hosted Bash Installer
+
+The supported non-Rust install path is the GitHub-hosted `install.sh` script.
+It downloads release archives from GitHub Releases, verifies the matching
+`SHA256SUMS` entry, installs the binary, and prints PATH guidance without
+modifying shell profiles.
+
+Useful options:
+
+```sh
+# Install a specific release tag.
+curl -fsSL https://raw.githubusercontent.com/tankrap/metric-collector/main/install.sh | sh -s -- \
+  --version v0.1.0
+
+# Install from another GitHub repo, useful for forks.
+curl -fsSL https://raw.githubusercontent.com/tankrap/metric-collector/main/install.sh | sh -s -- \
+  --repo owner/repo
+
+# Install from a local or self-hosted artifact directory for smoke tests.
+./install.sh --base-url ./dist --prefix /tmp/vc-tokmeter-install
+```
+
+The release workflow uploads stable platform artifact names and a combined
+`SHA256SUMS`, which keeps the hosted installer URL stable across releases.
 
 ## Current Source Checkout
 
@@ -126,26 +179,68 @@ See [claude-code.md](claude-code.md) for full setup notes and caveats.
 
 ## Static Binary
 
-Planned v1 install path:
+Manual install path:
 
 ```sh
 curl -L https://github.com/tankrap/metric-collector/releases/latest/download/vc-tokmeter-macos-arm64.tar.gz -o vc-tokmeter.tar.gz
 tar -xzf vc-tokmeter.tar.gz
-chmod +x vc-tokmeter
-./vc-tokmeter --help
+./vc-tokmeter-*/vc-tokmeter --help
 ```
 
 Installed binary usage:
 
 ```sh
-./vc-tokmeter init
-./vc-tokmeter doctor
-./vc-tokmeter run --profile baseline --task task-id
-./vc-tokmeter report --compare
+vc-tokmeter setup
+vc-tokmeter doctor
+vc-tokmeter live-test doctor --repo /path/to/repository
+vc-tokmeter report --event-log .tokmeter/events.jsonl --out .tokmeter/report
 ```
 
 This path is for repeat local use. The binary, local event logs, and installed
 capture wiring stay on the tester's machine until explicitly removed.
+
+Upload enrollment is not part of default setup. To opt in, save collector
+credentials explicitly, review the redacted payload first, then confirm the
+network upload:
+
+```sh
+vc-tokmeter setup --upload-endpoint https://collector.example.test/v1/uploads \
+  --upload-token "$VC_TOKMETER_UPLOAD_TOKEN"
+vc-tokmeter upload --dry-run
+vc-tokmeter upload --yes
+```
+
+The saved upload config lives at `.tokmeter/upload.json`. Rendered setup and
+upload output never prints the token value. To return to local-only reporting:
+
+```sh
+vc-tokmeter setup --remove-upload-config
+```
+
+## Uninstall and Cleanup
+
+Run uninstall from the repository that was configured:
+
+```sh
+vc-tokmeter uninstall
+vc-tokmeter doctor
+```
+
+Uninstall removes tokmeter-created hook blocks and setup files while preserving
+unrelated config entries. It intentionally leaves local evidence in `.tokmeter`
+so testers can inspect or upload aggregate reports later. To delete local event
+logs and reports after the study is complete:
+
+```sh
+rm -rf .tokmeter
+```
+
+To remove the installed executable installed by `install.sh`, delete the binary
+from the selected install directory:
+
+```sh
+rm -f "$HOME/.local/bin/vc-tokmeter"
+```
 
 ## npx Wrapper
 
@@ -182,8 +277,37 @@ Prerequisites:
 - Python 3 with `pipx`.
 - Provider-specific setup required by the selected adapter.
 
+## Live Test Matrix
+
+Installed users can print the same live-agent matrix without source scripts:
+
+```sh
+vc-tokmeter live-test doctor --repo /path/to/repository
+vc-tokmeter live-test codex-exec --repo /path/to/repository
+vc-tokmeter live-test codex-tui-api --repo /path/to/repository
+vc-tokmeter live-test codex-tui-subscription --repo /path/to/repository
+vc-tokmeter live-test claude-code-api --repo /path/to/repository
+vc-tokmeter live-test claude-code-subscription --repo /path/to/repository
+vc-tokmeter live-test claude-desktop-config --repo /path/to/repository
+vc-tokmeter live-test report --repo /path/to/repository
+```
+
+Each command prints the event log path, report path, commands to run, and key
+summary lines to inspect in the generated report.
+
+## Release Smoke Tests
+
+Release CI packages each target, installs the stable tarball through
+`install.sh`, verifies the checksum path, runs `vc-tokmeter --help`, `doctor`,
+`setup`, `report`, and `uninstall` from a temporary target repository, and
+checks that uninstall removed tokmeter hooks without deleting unrelated config.
+Run the same smoke locally after packaging:
+
+```sh
+scripts/release-install-smoke.sh --artifact dist/vc-tokmeter-macos-arm64.tar.gz
+```
+
 ## Unsupported Until Packaged
 
-The npm and pipx wrappers are placeholders until release packaging exists. Do
-not ask external testers to rely on them before the corresponding package names
-are published and `tokmeter doctor` passes through the wrapper path.
+The npm and pipx wrappers are placeholders until those package names are
+published and `vc-tokmeter doctor` passes through each wrapper path.

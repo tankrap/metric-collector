@@ -4,6 +4,10 @@ This workflow measures token-equivalent volume during normal AI-assisted git
 work. It is intended for studies of how much context moves through current git
 workflows when an AI agent is involved. It is not a billing report.
 
+For an external tester checklist that covers install, copy-paste prompts,
+reporting, optional upload, and uninstall in one place, see
+[tester-quickstart.md](tester-quickstart.md).
+
 Passive reports are Grade O evidence: the work is observed as it happens, but
 the workload is not controlled. Use the numbers to describe workflow token
 volume, operation mix, and rough before/after patterns. Do not frame them as
